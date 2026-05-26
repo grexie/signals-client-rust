@@ -871,8 +871,10 @@ impl PositionManager {
             }
         }
         let used_budget = self.config.position_size.min(total_weight);
-        let keys = self.positions.keys().cloned().collect::<Vec<_>>();
-        let mut orders = Vec::new();
+        let mut keys = self.positions.keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        let mut reductions = Vec::new();
+        let mut openings = Vec::new();
         for key in keys {
             let Some(position) = self.positions.get(&key).cloned() else {
                 continue;
@@ -884,8 +886,14 @@ impl PositionManager {
             } else {
                 0.0
             };
-            let delta = target_size - position.size;
+            let mut delta = target_size - position.size;
+            if is_flip_target(position.size, target_size) {
+                delta = -position.size;
+            }
             if delta.abs() <= 1e-9 {
+                if let Some(current) = self.positions.get_mut(&key) {
+                    current.confidence = weight;
+                }
                 continue;
             }
             let is_flip = position.size.abs() > 1e-9
@@ -898,37 +906,118 @@ impl PositionManager {
                 && !is_closing
                 && delta.abs() < self.effective_min_order_delta()
             {
+                if let Some(current) = self.positions.get_mut(&key) {
+                    current.confidence = weight;
+                }
                 continue;
             }
             let context = contexts.get(&key).copied().unwrap_or_default();
-            let order = self.order_for_delta(
-                &key,
-                &position,
+            let candidate = RebalanceCandidate {
+                key,
+                position: position.clone(),
                 delta,
-                context.expected_edge,
-                context.score,
-                order_reason(&position, target_size),
-                context.confidence,
+                weight,
+                context,
+                reason: order_reason(&position, target_size).to_string(),
+            };
+            if is_exposure_reduction(position.size, position.size + delta) {
+                reductions.push(candidate);
+            } else {
+                openings.push(candidate);
+            }
+        }
+        if !reductions.is_empty() {
+            return self.materialize_rebalance_orders(reductions, false);
+        }
+        self.materialize_rebalance_orders(openings, true)
+    }
+
+    fn materialize_rebalance_orders(
+        &mut self,
+        candidates: Vec<RebalanceCandidate>,
+        cap_openings: bool,
+    ) -> Vec<Order> {
+        let mut orders = Vec::new();
+        let mut opening_exposure_by_currency = HashMap::<String, f64>::new();
+        for candidate in candidates {
+            let mut delta = candidate.delta;
+            if cap_openings
+                && !is_exposure_reduction(candidate.position.size, candidate.position.size + delta)
+            {
+                let metadata = self
+                    .instruments
+                    .instrument(&candidate.position.venue, &candidate.position.instrument);
+                let used = *opening_exposure_by_currency
+                    .get(&metadata.settlement_currency)
+                    .unwrap_or(&0.0);
+                let available =
+                    self.available_exposure_budget(&metadata.settlement_currency) - used;
+                if available <= 1e-9 {
+                    if let Some(current) = self.positions.get_mut(&candidate.key) {
+                        current.confidence = candidate.weight;
+                    }
+                    continue;
+                }
+                if delta.abs() > available {
+                    delta = sign(delta) * available;
+                }
+            }
+            let mut order = self.order_for_delta(
+                &candidate.key,
+                &candidate.position,
+                delta,
+                candidate.context.expected_edge,
+                candidate.context.score,
+                &candidate.reason,
+                candidate.context.confidence,
             );
+            order.take_profit = candidate.context.take_profit;
+            order.stop_loss = candidate.context.stop_loss;
             if !self.order_meets_instrument_minimum(&order) {
+                if let Some(current) = self.positions.get_mut(&candidate.key) {
+                    current.confidence = candidate.weight;
+                }
                 continue;
             }
-            orders.push(Order {
-                take_profit: context.take_profit,
-                stop_loss: context.stop_loss,
-                ..order
-            });
+            if cap_openings && !is_exposure_reduction(order.previous_size, order.target_size) {
+                *opening_exposure_by_currency
+                    .entry(order.settlement_currency.clone())
+                    .or_insert(0.0) += order.size_delta.abs();
+            }
+            orders.push(order);
             self.apply_delta(
-                &key,
+                &candidate.key,
                 delta,
-                positive_or(position.last_price, position.entry_price, 0.0),
-                self.taker_fee_rate(&key),
+                positive_or(
+                    candidate.position.last_price,
+                    candidate.position.entry_price,
+                    0.0,
+                ),
+                self.taker_fee_rate(&candidate.key),
             );
-            if let Some(current) = self.positions.get_mut(&key) {
-                current.confidence = weight;
+            if let Some(current) = self.positions.get_mut(&candidate.key) {
+                current.confidence = candidate.weight;
             }
         }
         orders
+    }
+
+    fn available_exposure_budget(&self, currency: &str) -> f64 {
+        let Some(asset) = self.assets.asset(currency) else {
+            return f64::INFINITY;
+        };
+        let equity = positive_or(asset.equity, asset.cash + asset.used, asset.cash);
+        if equity <= 0.0 {
+            return if asset.available > 0.0 {
+                f64::INFINITY
+            } else {
+                0.0
+            };
+        }
+        if asset.available <= 0.0 {
+            return 0.0;
+        }
+        (asset.available / equity).max(0.0)
     }
 
     fn order_for_delta(
@@ -1125,6 +1214,16 @@ struct SignalContext {
     stop_loss: f64,
 }
 
+#[derive(Debug, Clone)]
+struct RebalanceCandidate {
+    key: String,
+    position: Position,
+    delta: f64,
+    weight: f64,
+    context: SignalContext,
+    reason: String,
+}
+
 fn normalize_config(mut config: PositionManagerConfig) -> PositionManagerConfig {
     config.position_size = config.position_size.clamp(0.0, 1.0);
     config.min_expected_edge = config.min_expected_edge.max(0.0);
@@ -1192,6 +1291,23 @@ fn order_reason(position: &Position, target_size: f64) -> &'static str {
     } else {
         "rebalance"
     }
+}
+
+fn is_flip_target(previous_size: f64, target_size: f64) -> bool {
+    previous_size.abs() > 1e-9 && target_size.abs() > 1e-9 && !same_sign(previous_size, target_size)
+}
+
+fn is_exposure_reduction(previous_size: f64, target_size: f64) -> bool {
+    if previous_size.abs() <= 1e-9 {
+        return false;
+    }
+    if target_size.abs() <= 1e-9 {
+        return true;
+    }
+    if !same_sign(previous_size, target_size) {
+        return true;
+    }
+    target_size.abs() < previous_size.abs() - 1e-9
 }
 
 fn positive_or(a: f64, b: f64, c: f64) -> f64 {
@@ -1308,7 +1424,23 @@ mod tests {
         assert_eq!(sell.len(), 1);
         assert_eq!(sell[0].side, Side::Sell);
         assert_eq!(sell[0].reason, "flip");
-        assert!(sell[0].size_delta < -0.19);
+        assert!(sell[0].target_size.abs() < 1e-9);
+        assert!((sell[0].size_delta + 0.10).abs() < 1e-9);
+
+        let open_short = manager.handle_signal(Signal {
+            venue: "okx".into(),
+            instrument: "BTC-USDT-SWAP".into(),
+            side: Side::Sell,
+            confidence: 0.9,
+            take_profit: 0.02,
+            stop_loss: 0.004,
+            score: -0.6,
+            price: 99.0,
+            ..Default::default()
+        });
+        assert_eq!(open_short.len(), 1);
+        assert_eq!(open_short[0].side, Side::Sell);
+        assert_eq!(open_short[0].reason, "opening");
     }
 
     #[test]
@@ -1543,6 +1675,112 @@ mod tests {
             ..Default::default()
         });
         assert!(orders.is_empty());
+    }
+
+    #[test]
+    fn phases_reductions_before_openings() {
+        let mut config = production_position_manager_config();
+        config.position_size = 0.20;
+        config.min_expected_edge = 0.0;
+        config.min_order_delta = 0.0;
+        let mut manager = PositionManager::new(config);
+        manager.asset_manager_mut().update_asset(AssetSnapshot {
+            currency: "USDT".into(),
+            cash: 1000.0,
+            available: 1000.0,
+            equity: 1000.0,
+            ..Default::default()
+        });
+        manager
+            .instrument_manager_mut()
+            .update_instrument(InstrumentMetadata {
+                venue: "okx".into(),
+                instrument: "BTC-USDT-SWAP".into(),
+                settlement_currency: "USDT".into(),
+                ..Default::default()
+            });
+        manager
+            .instrument_manager_mut()
+            .update_instrument(InstrumentMetadata {
+                venue: "okx".into(),
+                instrument: "ETH-USDT-SWAP".into(),
+                settlement_currency: "USDT".into(),
+                ..Default::default()
+            });
+        manager.add_position(Position {
+            venue: "okx".into(),
+            instrument: "BTC-USDT-SWAP".into(),
+            size: 0.15,
+            confidence: 1.0,
+            entry_price: 100.0,
+            last_price: 100.0,
+            ..Default::default()
+        });
+        let reductions = manager.handle_signal(Signal {
+            venue: "okx".into(),
+            instrument: "ETH-USDT-SWAP".into(),
+            side: Side::Buy,
+            confidence: 1.0,
+            take_profit: 0.02,
+            stop_loss: 0.004,
+            price: 100.0,
+            ..Default::default()
+        });
+        assert_eq!(reductions.len(), 1);
+        assert_eq!(reductions[0].instrument, "BTC-USDT-SWAP");
+        assert_eq!(reductions[0].side, Side::Sell);
+        assert!((reductions[0].target_size - 0.10).abs() < 1e-9);
+
+        let openings = manager.handle_signal(Signal {
+            venue: "okx".into(),
+            instrument: "ETH-USDT-SWAP".into(),
+            side: Side::Buy,
+            confidence: 1.0,
+            take_profit: 0.02,
+            stop_loss: 0.004,
+            price: 100.0,
+            ..Default::default()
+        });
+        assert_eq!(openings.len(), 1);
+        assert_eq!(openings[0].instrument, "ETH-USDT-SWAP");
+        assert_eq!(openings[0].side, Side::Buy);
+    }
+
+    #[test]
+    fn caps_openings_to_available_exposure() {
+        let mut config = production_position_manager_config();
+        config.position_size = 0.20;
+        config.min_expected_edge = 0.0;
+        config.min_order_delta = 0.0;
+        let mut manager = PositionManager::new(config);
+        manager.asset_manager_mut().update_asset(AssetSnapshot {
+            currency: "USDT".into(),
+            cash: 1000.0,
+            available: 50.0,
+            equity: 1000.0,
+            ..Default::default()
+        });
+        manager
+            .instrument_manager_mut()
+            .update_instrument(InstrumentMetadata {
+                venue: "okx".into(),
+                instrument: "BTC-USDT-SWAP".into(),
+                settlement_currency: "USDT".into(),
+                ..Default::default()
+            });
+        let orders = manager.handle_signal(Signal {
+            venue: "okx".into(),
+            instrument: "BTC-USDT-SWAP".into(),
+            side: Side::Buy,
+            confidence: 1.0,
+            take_profit: 0.02,
+            stop_loss: 0.004,
+            price: 100.0,
+            ..Default::default()
+        });
+        assert_eq!(orders.len(), 1);
+        assert!((orders[0].size_delta - 0.05).abs() < 1e-9);
+        assert!((orders[0].target_size - 0.05).abs() < 1e-9);
     }
 
     #[test]

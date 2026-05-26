@@ -4,7 +4,7 @@ Async Rust client crate for Grexie Signals websocket subscriptions and productio
 
 ```toml
 [dependencies]
-grexie-signals-client = "0.1.1"
+grexie-signals-client = "0.1.2"
 ```
 
 ## Websocket Client
@@ -61,7 +61,7 @@ let orders = manager.handle_signal(Signal {
 });
 ```
 
-The manager mirrors the server sizing behavior: `position_size` is the total portfolio budget, positions are weighted by confidence, `min_order_delta` scales by `position_size`, same-side churn can be suppressed by `rebalance_interval`, flips are allowed, fees affect realized PnL, and leverage is selected inside configured min/max bounds from confidence, fee-adjusted edge, and score.
+The manager mirrors the server sizing behavior: `position_size` is the total portfolio budget, positions are weighted by confidence, reductions/closes/first-phase flips are emitted before openings or increases, openings are capped by live asset available exposure when asset snapshots are attached, `min_order_delta` scales by `position_size`, same-side churn can be suppressed by `rebalance_interval`, flips are allowed, fees affect realized PnL, and leverage is selected inside configured min/max bounds from confidence, fee-adjusted edge, and score.
 
 `PositionManager` ignores replay signal events and ignores live signals whose venue/instrument pair has not been configured in its `InstrumentManager`.
 
