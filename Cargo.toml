@@ -1,0 +1,23 @@
+[package]
+name = "grexie-signals-client"
+version = "0.1.0"
+edition = "2021"
+description = "Typed Rust client for Grexie Signals websocket subscriptions and position management."
+license = "MIT"
+repository = "https://github.com/grexie/signals-client-rust"
+homepage = "https://github.com/grexie/signals-client-rust"
+readme = "README.md"
+keywords = ["grexie", "signals", "websocket", "trading"]
+categories = ["api-bindings", "web-programming::websocket"]
+
+[dependencies]
+futures-util = "0.3"
+http = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time"] }
+tokio-tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

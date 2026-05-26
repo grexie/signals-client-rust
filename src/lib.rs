@@ -1,0 +1,1469 @@
+//! Typed Rust client for Grexie Signals.
+//!
+//! `SignalsClient` manages the authenticated websocket subscription lifecycle.
+//! `PositionManager` consumes typed signal events and maintains an in-memory
+//! position book using the same confidence-weighted sizing model as the
+//! production Grexie Signals server.
+
+use std::collections::HashMap;
+use std::time::{Duration, SystemTime};
+
+use futures_util::stream::{SplitSink, SplitStream};
+use futures_util::{SinkExt, StreamExt};
+use http::Request;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::Message;
+use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+
+/// Authenticates a websocket connection to Grexie Signals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignalsWebSocketToken(pub String);
+
+/// Signal or position direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Side {
+    Buy,
+    Sell,
+}
+
+impl Default for Side {
+    fn default() -> Self {
+        Self::Buy
+    }
+}
+
+/// One timeframe contribution to an aggregate signal.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SignalComponent {
+    pub timeframe: String,
+    pub side: Side,
+    pub confidence: f64,
+    pub weight: f64,
+    pub signed_score: f64,
+    pub take_profit: f64,
+    pub stop_loss: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub probability: Vec<f64>,
+}
+
+/// Public signal payload sent by the Grexie Signals websocket.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct Signal {
+    #[serde(default)]
+    pub venue: String,
+    #[serde(default)]
+    pub instrument: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeframe: Option<String>,
+    #[serde(default)]
+    pub confidence: f64,
+    #[serde(default)]
+    pub side: Side,
+    #[serde(default)]
+    pub take_profit: f64,
+    #[serde(default)]
+    pub stop_loss: f64,
+    #[serde(default)]
+    pub score: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub components: Vec<SignalComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
+    #[serde(default)]
+    pub price: f64,
+}
+
+/// Typed websocket event.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SignalsEvent {
+    Ready {
+        message: String,
+    },
+    Subscribed {
+        subscription_id: i64,
+        venue: String,
+        instrument: String,
+    },
+    Unsubscribed {
+        subscription_id: Option<i64>,
+        venue: Option<String>,
+        instrument: Option<String>,
+        code: Option<String>,
+        message: Option<String>,
+    },
+    Info {
+        subscription_id: i64,
+        venue: String,
+        instrument: String,
+        stage: String,
+        message: String,
+        timestamp: Option<String>,
+        replay: bool,
+        replayed_at: Option<String>,
+    },
+    Signal {
+        subscription_id: i64,
+        venue: String,
+        instrument: String,
+        signal: Signal,
+        timestamp: Option<String>,
+        replay: bool,
+        replayed_at: Option<String>,
+    },
+    Error {
+        code: Option<String>,
+        message: Option<String>,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawEvent {
+    #[serde(rename = "type")]
+    event_type: String,
+    subscription_id: Option<i64>,
+    venue: Option<String>,
+    instrument: Option<String>,
+    code: Option<String>,
+    message: Option<String>,
+    stage: Option<String>,
+    timestamp: Option<String>,
+    replay: Option<bool>,
+    replayed_at: Option<String>,
+    signal: Option<Signal>,
+}
+
+/// Errors returned by the websocket client and protocol parser.
+#[derive(Debug, Error)]
+pub enum SignalsClientError {
+    #[error("websocket is not connected")]
+    NotConnected,
+    #[error("unsupported websocket event type {0}")]
+    UnsupportedEvent(String),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
+    #[error(transparent)]
+    Http(#[from] http::Error),
+}
+
+/// Decodes one raw websocket JSON message into a typed event.
+pub fn parse_event(raw: &str) -> Result<SignalsEvent, SignalsClientError> {
+    let msg: RawEvent = serde_json::from_str(raw)?;
+    match msg.event_type.as_str() {
+        "ready" => Ok(SignalsEvent::Ready {
+            message: msg.message.unwrap_or_default(),
+        }),
+        "subscribed" => Ok(SignalsEvent::Subscribed {
+            subscription_id: msg.subscription_id.unwrap_or_default(),
+            venue: msg.venue.unwrap_or_default(),
+            instrument: msg.instrument.unwrap_or_default(),
+        }),
+        "unsubscribed" => Ok(SignalsEvent::Unsubscribed {
+            subscription_id: msg.subscription_id,
+            venue: msg.venue,
+            instrument: msg.instrument,
+            code: msg.code,
+            message: msg.message,
+        }),
+        "info" => Ok(SignalsEvent::Info {
+            subscription_id: msg.subscription_id.unwrap_or_default(),
+            venue: msg.venue.unwrap_or_default(),
+            instrument: msg.instrument.unwrap_or_default(),
+            stage: msg.stage.unwrap_or_default(),
+            message: msg.message.unwrap_or_default(),
+            timestamp: msg.timestamp,
+            replay: msg.replay.unwrap_or(false),
+            replayed_at: msg.replayed_at,
+        }),
+        "signal" => {
+            let mut signal = msg.signal.unwrap_or_default();
+            let venue = msg.venue.unwrap_or_else(|| signal.venue.clone());
+            let instrument = msg.instrument.unwrap_or_else(|| signal.instrument.clone());
+            if signal.venue.is_empty() {
+                signal.venue = venue.clone();
+            }
+            if signal.instrument.is_empty() {
+                signal.instrument = instrument.clone();
+            }
+            if signal.timestamp.is_none() {
+                signal.timestamp = msg.timestamp.clone();
+            }
+            Ok(SignalsEvent::Signal {
+                subscription_id: msg.subscription_id.unwrap_or_default(),
+                venue,
+                instrument,
+                signal,
+                timestamp: msg.timestamp,
+                replay: msg.replay.unwrap_or(false),
+                replayed_at: msg.replayed_at,
+            })
+        }
+        "error" => Ok(SignalsEvent::Error {
+            code: msg.code,
+            message: msg.message,
+        }),
+        other => Err(SignalsClientError::UnsupportedEvent(other.to_string())),
+    }
+}
+
+type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// Authenticated asynchronous Grexie Signals websocket client.
+pub struct SignalsClient {
+    token: SignalsWebSocketToken,
+    url: String,
+    write: Option<SplitSink<WsStream, Message>>,
+    read: Option<SplitStream<WsStream>>,
+}
+
+impl SignalsClient {
+    /// Creates a client using the production websocket endpoint.
+    pub fn new(token: SignalsWebSocketToken) -> Self {
+        Self::with_url(token, "wss://signals.grexie.com/ws")
+    }
+
+    /// Creates a client using a complete websocket URL.
+    pub fn with_url(token: SignalsWebSocketToken, url: impl Into<String>) -> Self {
+        Self {
+            token,
+            url: url.into(),
+            write: None,
+            read: None,
+        }
+    }
+
+    /// Opens the websocket and authenticates with the token.
+    pub async fn connect(&mut self) -> Result<(), SignalsClientError> {
+        let mut request: Request<()> = self.url.as_str().into_client_request()?;
+        if !self.token.0.is_empty() {
+            request.headers_mut().insert(
+                "Authorization",
+                format!("Bearer {}", self.token.0).parse().unwrap(),
+            );
+        }
+        let (stream, _) = connect_async(request).await?;
+        let (write, read) = stream.split();
+        self.write = Some(write);
+        self.read = Some(read);
+        Ok(())
+    }
+
+    /// Subscribes to one venue/instrument pair.
+    pub async fn subscribe(
+        &mut self,
+        venue: &str,
+        instrument: &str,
+    ) -> Result<(), SignalsClientError> {
+        self.send_json(serde_json::json!({
+            "type": "subscribe",
+            "venue": venue,
+            "instrument": instrument
+        }))
+        .await
+    }
+
+    /// Unsubscribes by server subscription id.
+    pub async fn unsubscribe(&mut self, subscription_id: i64) -> Result<(), SignalsClientError> {
+        self.send_json(serde_json::json!({
+            "type": "unsubscribe",
+            "subscriptionId": subscription_id
+        }))
+        .await
+    }
+
+    /// Receives the next typed event.
+    pub async fn receive(&mut self) -> Result<Option<SignalsEvent>, SignalsClientError> {
+        let read = self.read.as_mut().ok_or(SignalsClientError::NotConnected)?;
+        match read.next().await {
+            Some(Ok(Message::Text(text))) => Ok(Some(parse_event(&text)?)),
+            Some(Ok(Message::Binary(bytes))) => Ok(Some(parse_event(
+                std::str::from_utf8(&bytes).unwrap_or(""),
+            )?)),
+            Some(Ok(_)) => Ok(None),
+            Some(Err(err)) => Err(err.into()),
+            None => Ok(None),
+        }
+    }
+
+    async fn send_json(&mut self, payload: serde_json::Value) -> Result<(), SignalsClientError> {
+        let write = self
+            .write
+            .as_mut()
+            .ok_or(SignalsClientError::NotConnected)?;
+        write.send(Message::Text(payload.to_string())).await?;
+        Ok(())
+    }
+}
+
+/// Per-instrument fee and leverage overrides.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InstrumentConfig {
+    pub maker_fee_rate: Option<f64>,
+    pub taker_fee_rate: Option<f64>,
+    pub min_leverage: Option<f64>,
+    pub max_leverage: Option<f64>,
+}
+
+/// Account state for one settlement currency.
+#[derive(Debug, Clone, Default)]
+pub struct AssetSnapshot {
+    pub currency: String,
+    pub cash: f64,
+    pub available: f64,
+    pub used: f64,
+    pub equity: f64,
+}
+
+/// Tracks cash, available balance, used margin, and equity as assets evolve.
+#[derive(Debug, Clone, Default)]
+pub struct AssetManager {
+    assets: HashMap<String, AssetSnapshot>,
+}
+
+impl AssetManager {
+    pub fn update_asset(&mut self, snapshot: AssetSnapshot) {
+        if !snapshot.currency.is_empty() {
+            self.assets.insert(snapshot.currency.clone(), snapshot);
+        }
+    }
+
+    pub fn asset(&self, currency: &str) -> Option<&AssetSnapshot> {
+        self.assets.get(currency)
+    }
+
+    pub fn assets(&self) -> Vec<AssetSnapshot> {
+        let mut assets = self.assets.values().cloned().collect::<Vec<_>>();
+        assets.sort_by(|a, b| a.currency.cmp(&b.currency));
+        assets
+    }
+}
+
+/// Exchange constraints for one venue/instrument.
+#[derive(Debug, Clone, Default)]
+pub struct InstrumentMetadata {
+    pub venue: String,
+    pub instrument: String,
+    pub settlement_currency: String,
+    pub lot_size: f64,
+    pub min_size: f64,
+    pub tick_size: f64,
+    pub max_leverage: f64,
+}
+
+/// Tracks lot size, minimum order size, tick size, settlement currency, and max leverage.
+#[derive(Debug, Clone, Default)]
+pub struct InstrumentManager {
+    instruments: HashMap<String, InstrumentMetadata>,
+}
+
+impl InstrumentManager {
+    pub fn update_instrument(&mut self, mut metadata: InstrumentMetadata) {
+        if metadata.venue.is_empty() || metadata.instrument.is_empty() {
+            return;
+        }
+        if metadata.settlement_currency.is_empty() {
+            metadata.settlement_currency = "USDT".to_string();
+        }
+        self.instruments.insert(
+            position_key(&metadata.venue, &metadata.instrument),
+            metadata,
+        );
+    }
+
+    pub fn instrument(&self, venue: &str, instrument: &str) -> InstrumentMetadata {
+        self.instruments
+            .get(&position_key(venue, instrument))
+            .cloned()
+            .unwrap_or_else(|| InstrumentMetadata {
+                venue: venue.to_string(),
+                instrument: instrument.to_string(),
+                settlement_currency: "USDT".to_string(),
+                ..Default::default()
+            })
+    }
+
+    pub fn instruments(&self) -> Vec<InstrumentMetadata> {
+        let mut instruments = self.instruments.values().cloned().collect::<Vec<_>>();
+        instruments.sort_by(|a, b| (&a.venue, &a.instrument).cmp(&(&b.venue, &b.instrument)));
+        instruments
+    }
+}
+
+/// Fee-aware position manager configuration.
+#[derive(Debug, Clone)]
+pub struct PositionManagerConfig {
+    pub position_size: f64,
+    pub min_expected_edge: f64,
+    pub min_order_delta: f64,
+    pub rebalance_interval: Duration,
+    pub maker_fee_rate: f64,
+    pub taker_fee_rate: f64,
+    pub min_leverage: f64,
+    pub max_leverage: f64,
+    pub instruments: HashMap<String, InstrumentConfig>,
+}
+
+impl Default for PositionManagerConfig {
+    fn default() -> Self {
+        production_position_manager_config()
+    }
+}
+
+/// Returns the same execution-policy defaults used by the Grexie Signals server.
+pub fn production_position_manager_config() -> PositionManagerConfig {
+    PositionManagerConfig {
+        position_size: 1.0,
+        min_expected_edge: 0.0045,
+        min_order_delta: 0.20,
+        rebalance_interval: Duration::from_secs(6 * 60 * 60),
+        maker_fee_rate: 0.0002,
+        taker_fee_rate: 0.0005,
+        min_leverage: 1.0,
+        max_leverage: 1.0,
+        instruments: HashMap::new(),
+    }
+}
+
+/// In-memory position state.
+#[derive(Debug, Clone, Default)]
+pub struct Position {
+    pub venue: String,
+    pub instrument: String,
+    pub size: f64,
+    pub confidence: f64,
+    pub entry_price: f64,
+    pub last_price: f64,
+    pub take_profit: f64,
+    pub stop_loss: f64,
+    pub leverage: f64,
+    pub realized_gross: f64,
+    pub fees: f64,
+    pub realized_pnl: f64,
+    pub opened_at: Option<SystemTime>,
+    pub last_signal_at: Option<SystemTime>,
+}
+
+impl Position {
+    pub fn side(&self) -> Option<Side> {
+        if self.size < 0.0 {
+            Some(Side::Sell)
+        } else if self.size > 0.0 {
+            Some(Side::Buy)
+        } else {
+            None
+        }
+    }
+
+    pub fn unrealized_pnl(&self) -> f64 {
+        self.price_move() * self.size.abs()
+    }
+
+    fn price_move(&self) -> f64 {
+        if self.entry_price <= 0.0 || self.last_price <= 0.0 {
+            return 0.0;
+        }
+        if self.size < 0.0 {
+            (self.entry_price - self.last_price) / self.entry_price
+        } else {
+            (self.last_price - self.entry_price) / self.entry_price
+        }
+    }
+}
+
+/// Target order recommendation emitted by `PositionManager`.
+#[derive(Debug, Clone)]
+pub struct Order {
+    pub venue: String,
+    pub instrument: String,
+    pub side: Side,
+    pub reason: String,
+    pub size_delta: f64,
+    pub previous_size: f64,
+    pub target_size: f64,
+    pub price: f64,
+    pub confidence: f64,
+    pub score: f64,
+    pub expected_edge: f64,
+    pub fee_rate: f64,
+    pub estimated_fee: f64,
+    pub estimated_fee_value: f64,
+    pub quantity: f64,
+    pub notional: f64,
+    pub settlement_currency: String,
+    pub min_size: f64,
+    pub lot_size: f64,
+    pub tick_size: f64,
+    pub leverage: f64,
+    pub take_profit: f64,
+    pub stop_loss: f64,
+}
+
+/// Closed realized trade snapshot.
+#[derive(Debug, Clone)]
+pub struct ClosedTrade {
+    pub venue: String,
+    pub instrument: String,
+    pub side: Side,
+    pub size: f64,
+    pub entry_price: f64,
+    pub exit_price: f64,
+    pub realized_gross: f64,
+    pub fees: f64,
+    pub realized_pnl: f64,
+}
+
+/// Current runtime PnL stats.
+#[derive(Debug, Clone, Default)]
+pub struct PositionStats {
+    pub equity: f64,
+    pub available: f64,
+    pub used: f64,
+    pub realized_pnl: f64,
+    pub unrealized_pnl: f64,
+    pub fees: f64,
+    pub realized_pnl_percent: f64,
+    pub unrealized_pnl_percent: f64,
+    pub total_pnl_percent: f64,
+    pub by_instrument: HashMap<String, InstrumentPositionStats>,
+    pub by_currency: HashMap<String, CurrencyPositionStats>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct InstrumentPositionStats {
+    pub venue: String,
+    pub instrument: String,
+    pub settlement_currency: String,
+    pub side: Option<Side>,
+    pub size: f64,
+    pub quantity: f64,
+    pub notional: f64,
+    pub realized_pnl: f64,
+    pub unrealized_pnl: f64,
+    pub fees: f64,
+    pub realized_pnl_percent: f64,
+    pub unrealized_pnl_percent: f64,
+    pub total_pnl_percent: f64,
+    pub leverage: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CurrencyPositionStats {
+    pub settlement_currency: String,
+    pub equity: f64,
+    pub available: f64,
+    pub used: f64,
+    pub realized_pnl: f64,
+    pub unrealized_pnl: f64,
+    pub fees: f64,
+    pub realized_pnl_percent: f64,
+    pub unrealized_pnl_percent: f64,
+    pub total_pnl_percent: f64,
+}
+
+/// In-memory, fee-aware production-style position manager.
+pub struct PositionManager {
+    config: PositionManagerConfig,
+    assets: AssetManager,
+    instruments: InstrumentManager,
+    positions: HashMap<String, Position>,
+    closed: Vec<ClosedTrade>,
+}
+
+impl PositionManager {
+    pub fn new(config: PositionManagerConfig) -> Self {
+        Self {
+            config: normalize_config(config),
+            assets: AssetManager::default(),
+            instruments: InstrumentManager::default(),
+            positions: HashMap::new(),
+            closed: Vec::new(),
+        }
+    }
+
+    pub fn asset_manager(&self) -> &AssetManager {
+        &self.assets
+    }
+
+    pub fn asset_manager_mut(&mut self) -> &mut AssetManager {
+        &mut self.assets
+    }
+
+    pub fn instrument_manager(&self) -> &InstrumentManager {
+        &self.instruments
+    }
+
+    pub fn instrument_manager_mut(&mut self) -> &mut InstrumentManager {
+        &mut self.instruments
+    }
+
+    pub fn add_position(&mut self, position: Position) {
+        self.positions.insert(
+            position_key(&position.venue, &position.instrument),
+            position,
+        );
+    }
+
+    pub fn update_position(&mut self, position: Position) {
+        self.add_position(position);
+    }
+
+    pub fn close_position(&mut self, venue: &str, instrument: &str) -> Vec<Order> {
+        let key = position_key(venue, instrument);
+        let Some(position) = self.positions.get(&key).cloned() else {
+            return Vec::new();
+        };
+        if position.size.abs() <= 1e-9 {
+            return Vec::new();
+        }
+        let delta = -position.size;
+        let order = self.order_for_delta(
+            &key,
+            &position,
+            delta,
+            0.0,
+            0.0,
+            "closing",
+            position.confidence,
+        );
+        self.apply_delta(
+            &key,
+            delta,
+            positive_or(position.last_price, position.entry_price, 0.0),
+            self.taker_fee_rate(&key),
+        );
+        vec![order]
+    }
+
+    pub fn positions(&self) -> Vec<Position> {
+        let mut positions = self.positions.values().cloned().collect::<Vec<_>>();
+        positions.sort_by(|a, b| (&a.venue, &a.instrument).cmp(&(&b.venue, &b.instrument)));
+        positions
+    }
+
+    pub fn closed_trades(&self) -> &[ClosedTrade] {
+        &self.closed
+    }
+
+    pub fn stats(&self) -> PositionStats {
+        let mut stats = PositionStats::default();
+        for asset in self.assets.assets() {
+            stats.equity += asset.equity;
+            stats.available += asset.available;
+            stats.used += asset.used;
+            stats.by_currency.insert(
+                asset.currency.clone(),
+                CurrencyPositionStats {
+                    settlement_currency: asset.currency,
+                    equity: asset.equity,
+                    available: asset.available,
+                    used: asset.used,
+                    ..Default::default()
+                },
+            );
+        }
+        for (key, position) in &self.positions {
+            let metadata = self
+                .instruments
+                .instrument(&position.venue, &position.instrument);
+            let asset = self.assets.asset(&metadata.settlement_currency);
+            let equity = positive_or(
+                asset.map(|a| a.equity).unwrap_or(0.0),
+                asset.map(|a| a.cash + a.used).unwrap_or(0.0),
+                1.0,
+            );
+            let price = round_to_tick(
+                positive_or(position.last_price, position.entry_price, 0.0),
+                metadata.tick_size,
+            );
+            let notional_raw = position.size.abs()
+                * equity
+                * positive_or(position.leverage, self.min_leverage(key), 1.0);
+            let quantity = if price > 0.0 {
+                round_down_to_step(notional_raw / price, metadata.lot_size)
+            } else {
+                0.0
+            };
+            let notional = quantity * price;
+            let realized = position.realized_pnl * equity;
+            let unrealized = position.unrealized_pnl() * equity;
+            let fees = position.fees * equity;
+            stats.by_instrument.insert(
+                key.clone(),
+                InstrumentPositionStats {
+                    venue: position.venue.clone(),
+                    instrument: position.instrument.clone(),
+                    settlement_currency: metadata.settlement_currency.clone(),
+                    side: position.side(),
+                    size: position.size,
+                    quantity,
+                    notional,
+                    realized_pnl: realized,
+                    unrealized_pnl: unrealized,
+                    fees,
+                    realized_pnl_percent: position.realized_pnl,
+                    unrealized_pnl_percent: position.unrealized_pnl(),
+                    total_pnl_percent: position.realized_pnl + position.unrealized_pnl(),
+                    leverage: position.leverage,
+                },
+            );
+            stats.realized_pnl += realized;
+            stats.unrealized_pnl += unrealized;
+            stats.fees += fees;
+            let currency = stats
+                .by_currency
+                .entry(metadata.settlement_currency.clone())
+                .or_insert_with(|| CurrencyPositionStats {
+                    settlement_currency: metadata.settlement_currency.clone(),
+                    equity,
+                    ..Default::default()
+                });
+            currency.realized_pnl += realized;
+            currency.unrealized_pnl += unrealized;
+            currency.fees += fees;
+            if currency.equity > 0.0 {
+                currency.realized_pnl_percent = currency.realized_pnl / currency.equity;
+                currency.unrealized_pnl_percent = currency.unrealized_pnl / currency.equity;
+                currency.total_pnl_percent =
+                    (currency.realized_pnl + currency.unrealized_pnl) / currency.equity;
+            }
+        }
+        if stats.equity <= 0.0 {
+            stats.equity = 1.0;
+        }
+        stats.realized_pnl_percent = stats.realized_pnl / stats.equity;
+        stats.unrealized_pnl_percent = stats.unrealized_pnl / stats.equity;
+        stats.total_pnl_percent = (stats.realized_pnl + stats.unrealized_pnl) / stats.equity;
+        stats
+    }
+
+    pub fn handle_event(&mut self, event: &SignalsEvent) -> Vec<Order> {
+        if let SignalsEvent::Signal { signal, .. } = event {
+            self.handle_signal(signal.clone())
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub fn handle_signal(&mut self, signal: Signal) -> Vec<Order> {
+        if signal.venue.is_empty() || signal.instrument.is_empty() {
+            return Vec::new();
+        }
+        let key = position_key(&signal.venue, &signal.instrument);
+        let target_sign = side_sign(signal.side);
+        let target_confidence = clamp01(signal.confidence);
+        if target_sign == 0.0 || target_confidence <= 0.0 {
+            return Vec::new();
+        }
+        let edge = fee_adjusted_expected_edge(&signal, self.taker_fee_rate(&key));
+        if self.config.min_expected_edge > 0.0 && edge < self.config.min_expected_edge {
+            return Vec::new();
+        }
+        let target_size = target_sign * self.config.position_size * target_confidence;
+        let min_order_delta = self.effective_min_order_delta();
+        let now = SystemTime::now();
+        let leverage = self.select_leverage(&key, target_confidence, edge, signal.score);
+        let position = self
+            .positions
+            .entry(key.clone())
+            .or_insert_with(|| Position {
+                venue: signal.venue.clone(),
+                instrument: signal.instrument.clone(),
+                entry_price: signal.price,
+                last_price: signal.price,
+                opened_at: Some(now),
+                ..Default::default()
+            });
+        if position.size.abs() <= 1e-9 && target_size.abs() < min_order_delta {
+            return Vec::new();
+        }
+        let is_flip = sign(position.size) != 0.0 && sign(position.size) != target_sign;
+        if !is_flip && position.size.abs() > 1e-9 {
+            if let Some(last_signal_at) = position.last_signal_at {
+                if self.config.rebalance_interval > Duration::ZERO
+                    && now.duration_since(last_signal_at).unwrap_or_default()
+                        < self.config.rebalance_interval
+                {
+                    return Vec::new();
+                }
+            }
+            if min_order_delta > 0.0 && (target_size - position.size).abs() < min_order_delta {
+                return Vec::new();
+            }
+        }
+        position.confidence = target_confidence;
+        position.last_signal_at = Some(now);
+        if signal.price > 0.0 {
+            position.last_price = signal.price;
+            if position.entry_price <= 0.0 {
+                position.entry_price = signal.price;
+            }
+        }
+        if position.take_profit <= 0.0
+            || position.stop_loss <= 0.0
+            || position.side() != Some(signal.side)
+        {
+            position.take_profit = signal.take_profit;
+            position.stop_loss = signal.stop_loss;
+        } else {
+            position.take_profit = blend_risk(position.take_profit, signal.take_profit, 0.5);
+            position.stop_loss = blend_risk(position.stop_loss, signal.stop_loss, 0.5);
+        }
+        position.leverage = leverage;
+        self.rebalance(
+            HashMap::from([(key.clone(), target_sign)]),
+            HashMap::from([(
+                key,
+                SignalContext {
+                    confidence: target_confidence,
+                    score: signal.score,
+                    expected_edge: edge,
+                    take_profit: signal.take_profit,
+                    stop_loss: signal.stop_loss,
+                },
+            )]),
+        )
+    }
+
+    fn rebalance(
+        &mut self,
+        side_overrides: HashMap<String, f64>,
+        contexts: HashMap<String, SignalContext>,
+    ) -> Vec<Order> {
+        let mut weights = HashMap::new();
+        let mut sides = HashMap::new();
+        let mut total_weight = 0.0;
+        for (key, position) in &self.positions {
+            let has_override = side_overrides.contains_key(key);
+            let mut weight = clamp01(position.confidence);
+            if !has_override && weight <= 0.0 {
+                weight = confidence_from_size(position, self.config.position_size);
+            }
+            let mut side = sign(position.size);
+            if let Some(override_side) = side_overrides.get(key) {
+                side = *override_side;
+            }
+            weights.insert(key.clone(), weight);
+            sides.insert(key.clone(), side);
+            if weight > 1e-9 && side != 0.0 {
+                total_weight += weight;
+            }
+        }
+        let used_budget = self.config.position_size.min(total_weight);
+        let keys = self.positions.keys().cloned().collect::<Vec<_>>();
+        let mut orders = Vec::new();
+        for key in keys {
+            let Some(position) = self.positions.get(&key).cloned() else {
+                continue;
+            };
+            let weight = *weights.get(&key).unwrap_or(&0.0);
+            let side = *sides.get(&key).unwrap_or(&0.0);
+            let target_size = if total_weight > 0.0 {
+                side * used_budget * weight / total_weight
+            } else {
+                0.0
+            };
+            let delta = target_size - position.size;
+            if delta.abs() <= 1e-9 {
+                continue;
+            }
+            let is_flip = position.size.abs() > 1e-9
+                && target_size.abs() > 1e-9
+                && !same_sign(position.size, target_size);
+            let is_opening = position.size.abs() <= 1e-9 && target_size.abs() > 1e-9;
+            let is_closing = target_size.abs() <= 1e-9 && position.size.abs() > 1e-9;
+            if !is_flip
+                && !is_opening
+                && !is_closing
+                && delta.abs() < self.effective_min_order_delta()
+            {
+                continue;
+            }
+            let context = contexts.get(&key).copied().unwrap_or_default();
+            let order = self.order_for_delta(
+                &key,
+                &position,
+                delta,
+                context.expected_edge,
+                context.score,
+                order_reason(&position, target_size),
+                context.confidence,
+            );
+            if !self.order_meets_instrument_minimum(&order) {
+                continue;
+            }
+            orders.push(Order {
+                take_profit: context.take_profit,
+                stop_loss: context.stop_loss,
+                ..order
+            });
+            self.apply_delta(
+                &key,
+                delta,
+                positive_or(position.last_price, position.entry_price, 0.0),
+                self.taker_fee_rate(&key),
+            );
+            if let Some(current) = self.positions.get_mut(&key) {
+                current.confidence = weight;
+            }
+        }
+        orders
+    }
+
+    fn order_for_delta(
+        &self,
+        key: &str,
+        position: &Position,
+        delta: f64,
+        edge: f64,
+        score: f64,
+        reason: &str,
+        confidence: f64,
+    ) -> Order {
+        let fee_rate = self.taker_fee_rate(key);
+        let metadata = self
+            .instruments
+            .instrument(&position.venue, &position.instrument);
+        let asset = self.assets.asset(&metadata.settlement_currency);
+        let leverage = self.select_leverage(key, confidence, edge, score);
+        let equity = positive_or(
+            asset.map(|a| a.equity).unwrap_or(0.0),
+            asset.map(|a| a.cash + a.used).unwrap_or(0.0),
+            1.0,
+        );
+        let price = round_to_tick(
+            positive_or(position.last_price, position.entry_price, 0.0),
+            metadata.tick_size,
+        );
+        let mut notional = delta.abs() * equity * leverage;
+        let quantity = if price > 0.0 {
+            round_down_to_step(notional / price, metadata.lot_size)
+        } else {
+            0.0
+        };
+        notional = quantity * price;
+        Order {
+            venue: position.venue.clone(),
+            instrument: position.instrument.clone(),
+            side: if delta < 0.0 { Side::Sell } else { Side::Buy },
+            reason: reason.to_string(),
+            size_delta: delta,
+            previous_size: position.size,
+            target_size: position.size + delta,
+            price,
+            confidence,
+            score,
+            expected_edge: edge,
+            fee_rate,
+            estimated_fee: delta.abs() * fee_rate,
+            estimated_fee_value: notional * fee_rate,
+            quantity,
+            notional,
+            settlement_currency: metadata.settlement_currency,
+            min_size: metadata.min_size,
+            lot_size: metadata.lot_size,
+            tick_size: metadata.tick_size,
+            leverage,
+            take_profit: 0.0,
+            stop_loss: 0.0,
+        }
+    }
+
+    fn apply_delta(&mut self, key: &str, delta: f64, price: f64, fee_rate: f64) {
+        let Some(mut position) = self.positions.remove(key) else {
+            return;
+        };
+        if position.size == 0.0 || same_sign(position.size, delta) {
+            let next_abs = position.size.abs() + delta.abs();
+            if price > 0.0 {
+                position.entry_price =
+                    if next_abs > 0.0 && position.size.abs() > 1e-9 && position.entry_price > 0.0 {
+                        (position.entry_price * position.size.abs() + price * delta.abs())
+                            / next_abs
+                    } else {
+                        price
+                    };
+                position.last_price = price;
+            }
+            let fee = delta.abs() * fee_rate;
+            position.fees += fee;
+            position.realized_pnl -= fee;
+            position.size += delta;
+            self.positions.insert(key.to_string(), position);
+            return;
+        }
+        if price > 0.0 {
+            position.last_price = price;
+        }
+        let closing = position.size.abs().min(delta.abs());
+        let gross = position.price_move() * closing;
+        let fee = closing * fee_rate;
+        position.realized_gross += gross;
+        position.fees += fee;
+        position.realized_pnl += gross - fee;
+        let closed = ClosedTrade {
+            venue: position.venue.clone(),
+            instrument: position.instrument.clone(),
+            side: position.side().unwrap_or(Side::Buy),
+            size: closing,
+            entry_price: position.entry_price,
+            exit_price: price,
+            realized_gross: position.realized_gross,
+            fees: position.fees,
+            realized_pnl: position.realized_pnl,
+        };
+        let remaining = delta.abs() - closing;
+        if remaining <= 1e-9 {
+            position.size += delta;
+            if position.size.abs() <= 1e-9 {
+                self.closed.push(closed);
+            } else {
+                self.positions.insert(key.to_string(), position);
+            }
+            return;
+        }
+        self.closed.push(closed);
+        position.size = sign(delta) * remaining;
+        position.entry_price = price;
+        position.last_price = price;
+        position.confidence = 0.0;
+        position.realized_gross = 0.0;
+        position.fees = remaining * fee_rate;
+        position.realized_pnl = -position.fees;
+        self.positions.insert(key.to_string(), position);
+    }
+
+    fn effective_min_order_delta(&self) -> f64 {
+        self.config.min_order_delta.max(0.0) * self.config.position_size.max(0.0)
+    }
+
+    fn select_leverage(&self, key: &str, confidence: f64, edge: f64, score: f64) -> f64 {
+        let min_leverage = self.min_leverage(key);
+        let max_leverage = self.max_leverage(key).max(min_leverage);
+        if (max_leverage - min_leverage).abs() <= f64::EPSILON {
+            return min_leverage;
+        }
+        let edge_score = clamp01(edge / (self.config.min_expected_edge * 3.0).max(0.001));
+        let quality =
+            clamp01(clamp01(confidence) * 0.65 + edge_score * 0.25 + score.abs().min(1.0) * 0.10);
+        min_leverage + (max_leverage - min_leverage) * quality
+    }
+
+    fn taker_fee_rate(&self, key: &str) -> f64 {
+        self.config
+            .instruments
+            .get(key)
+            .and_then(|c| c.taker_fee_rate)
+            .unwrap_or(self.config.taker_fee_rate)
+    }
+
+    fn min_leverage(&self, key: &str) -> f64 {
+        self.config
+            .instruments
+            .get(key)
+            .and_then(|c| c.min_leverage)
+            .unwrap_or(self.config.min_leverage)
+    }
+
+    fn max_leverage(&self, key: &str) -> f64 {
+        let configured = self
+            .config
+            .instruments
+            .get(key)
+            .and_then(|c| c.max_leverage)
+            .unwrap_or(self.config.max_leverage);
+        let (venue, instrument) = split_key(key);
+        let metadata_max = self.instruments.instrument(venue, instrument).max_leverage;
+        if metadata_max > 0.0 && configured > 0.0 {
+            configured.min(metadata_max)
+        } else {
+            configured
+        }
+    }
+
+    fn order_meets_instrument_minimum(&self, order: &Order) -> bool {
+        if order.reason == "closing" || order.reason == "flip" {
+            return true;
+        }
+        if order.min_size > 0.0 && order.quantity > 0.0 && order.quantity < order.min_size {
+            return false;
+        }
+        if order.min_size > 0.0 && order.quantity <= 0.0 {
+            return false;
+        }
+        true
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SignalContext {
+    confidence: f64,
+    score: f64,
+    expected_edge: f64,
+    take_profit: f64,
+    stop_loss: f64,
+}
+
+fn normalize_config(mut config: PositionManagerConfig) -> PositionManagerConfig {
+    config.position_size = config.position_size.clamp(0.0, 1.0);
+    config.min_expected_edge = config.min_expected_edge.max(0.0);
+    config.min_order_delta = config.min_order_delta.clamp(0.0, 1.0);
+    config.maker_fee_rate = config.maker_fee_rate.max(0.0);
+    config.taker_fee_rate = config.taker_fee_rate.max(0.0);
+    config.min_leverage = config.min_leverage.max(0.0);
+    config.max_leverage = config.max_leverage.max(0.0);
+    config
+}
+
+fn position_key(venue: &str, instrument: &str) -> String {
+    format!("{venue}:{instrument}")
+}
+
+fn side_sign(side: Side) -> f64 {
+    match side {
+        Side::Buy => 1.0,
+        Side::Sell => -1.0,
+    }
+}
+
+fn sign(value: f64) -> f64 {
+    if value < 0.0 {
+        -1.0
+    } else if value > 0.0 {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+fn same_sign(a: f64, b: f64) -> bool {
+    sign(a) == sign(b)
+}
+
+fn clamp01(value: f64) -> f64 {
+    value.clamp(0.0, 1.0)
+}
+
+fn confidence_from_size(position: &Position, position_size: f64) -> f64 {
+    if position_size <= 0.0 {
+        clamp01(position.size.abs())
+    } else {
+        clamp01(position.size.abs() / position_size)
+    }
+}
+
+fn expected_edge(signal: &Signal) -> f64 {
+    clamp01(signal.confidence) * signal.take_profit.max(0.0)
+        - (1.0 - clamp01(signal.confidence)) * signal.stop_loss.max(0.0)
+}
+
+fn fee_adjusted_expected_edge(signal: &Signal, taker_fee_rate: f64) -> f64 {
+    expected_edge(signal) - 2.0 * taker_fee_rate
+}
+
+fn order_reason(position: &Position, target_size: f64) -> &'static str {
+    if position.size.abs() <= 1e-9 {
+        "opening"
+    } else if target_size.abs() <= 1e-9 {
+        "closing"
+    } else if !same_sign(position.size, target_size) {
+        "flip"
+    } else {
+        "rebalance"
+    }
+}
+
+fn positive_or(a: f64, b: f64, c: f64) -> f64 {
+    if a > 0.0 {
+        a
+    } else if b > 0.0 {
+        b
+    } else {
+        c.max(0.0)
+    }
+}
+
+fn round_down_to_step(value: f64, step: f64) -> f64 {
+    if value <= 0.0 || step <= 0.0 {
+        value
+    } else {
+        (value / step).floor() * step
+    }
+}
+
+fn round_to_tick(value: f64, tick: f64) -> f64 {
+    if value <= 0.0 || tick <= 0.0 {
+        value
+    } else {
+        (value / tick).round() * tick
+    }
+}
+
+fn split_key(key: &str) -> (&str, &str) {
+    key.split_once(':').unwrap_or(("", key))
+}
+
+fn blend_risk(current: f64, incoming: f64, gate: f64) -> f64 {
+    if current <= 0.0 {
+        return incoming;
+    }
+    if incoming <= 0.0 {
+        return current;
+    }
+    let gate = clamp01(gate);
+    current * (1.0 - gate) + incoming * gate
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_signal_replay_event() {
+        let event = parse_event(r#"{"type":"signal","subscriptionId":4,"venue":"okx","instrument":"BTC-USDT-SWAP","timestamp":"2026-05-26T00:00:00Z","replay":true,"signal":{"confidence":0.8,"side":"buy","takeProfit":0.01,"stopLoss":0.004}}"#).unwrap();
+        match event {
+            SignalsEvent::Signal {
+                subscription_id,
+                signal,
+                replay,
+                ..
+            } => {
+                assert_eq!(subscription_id, 4);
+                assert_eq!(signal.venue, "okx");
+                assert_eq!(signal.instrument, "BTC-USDT-SWAP");
+                assert_eq!(signal.side, Side::Buy);
+                assert!(replay);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn position_manager_opens_and_flips() {
+        let mut config = production_position_manager_config();
+        config.position_size = 0.10;
+        config.min_expected_edge = 0.0;
+        config.min_order_delta = 0.20;
+        config.rebalance_interval = Duration::from_secs(3600);
+        config.max_leverage = 5.0;
+        let mut manager = PositionManager::new(config);
+        let buy = manager.handle_signal(Signal {
+            venue: "okx".into(),
+            instrument: "BTC-USDT-SWAP".into(),
+            side: Side::Buy,
+            confidence: 0.8,
+            take_profit: 0.02,
+            stop_loss: 0.004,
+            score: 0.5,
+            price: 100.0,
+            ..Default::default()
+        });
+        assert_eq!(buy.len(), 1);
+        assert_eq!(buy[0].reason, "opening");
+        assert!((buy[0].target_size - 0.10).abs() < 1e-9);
+
+        let sell = manager.handle_signal(Signal {
+            venue: "okx".into(),
+            instrument: "BTC-USDT-SWAP".into(),
+            side: Side::Sell,
+            confidence: 0.9,
+            take_profit: 0.02,
+            stop_loss: 0.004,
+            score: -0.6,
+            price: 99.0,
+            ..Default::default()
+        });
+        assert_eq!(sell.len(), 1);
+        assert_eq!(sell[0].side, Side::Sell);
+        assert_eq!(sell[0].reason, "flip");
+        assert!(sell[0].size_delta < -0.19);
+    }
+
+    #[test]
+    fn min_delta_scales_to_position_size() {
+        let mut config = production_position_manager_config();
+        config.position_size = 0.10;
+        config.min_expected_edge = 0.0;
+        config.min_order_delta = 0.20;
+        let mut manager = PositionManager::new(config);
+        let rejected = manager.handle_signal(Signal {
+            venue: "okx".into(),
+            instrument: "DOGE-USDT-SWAP".into(),
+            side: Side::Buy,
+            confidence: 0.15,
+            take_profit: 0.02,
+            stop_loss: 0.004,
+            price: 0.2,
+            ..Default::default()
+        });
+        assert!(rejected.is_empty());
+        let accepted = manager.handle_signal(Signal {
+            venue: "okx".into(),
+            instrument: "DOGE-USDT-SWAP".into(),
+            side: Side::Buy,
+            confidence: 0.25,
+            take_profit: 0.02,
+            stop_loss: 0.004,
+            price: 0.2,
+            ..Default::default()
+        });
+        assert_eq!(accepted.len(), 1);
+    }
+
+    #[test]
+    fn parses_info_and_error_events() {
+        let info = parse_event(r#"{"type":"info","subscriptionId":3,"venue":"okx","instrument":"DOGE-USDT-SWAP","stage":"ready","message":"ready","replay":true,"replayedAt":"2026-05-26T00:00:01Z"}"#).unwrap();
+        match info {
+            SignalsEvent::Info {
+                stage,
+                replay,
+                replayed_at,
+                ..
+            } => {
+                assert_eq!(stage, "ready");
+                assert!(replay);
+                assert!(replayed_at.is_some());
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        let error =
+            parse_event(r#"{"type":"error","code":"forbidden","message":"no access"}"#).unwrap();
+        match error {
+            SignalsEvent::Error { code, message } => {
+                assert_eq!(code.as_deref(), Some("forbidden"));
+                assert_eq!(message.as_deref(), Some("no access"));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn asset_and_instrument_managers_create_concrete_orders() {
+        let mut config = production_position_manager_config();
+        config.position_size = 0.10;
+        config.min_expected_edge = 0.0;
+        config.min_order_delta = 0.0;
+        config.max_leverage = 5.0;
+        let mut manager = PositionManager::new(config);
+        manager.asset_manager_mut().update_asset(AssetSnapshot {
+            currency: "USDT".into(),
+            cash: 1000.0,
+            available: 900.0,
+            used: 100.0,
+            equity: 1000.0,
+        });
+        manager
+            .instrument_manager_mut()
+            .update_instrument(InstrumentMetadata {
+                venue: "okx".into(),
+                instrument: "BTC-USDT-SWAP".into(),
+                settlement_currency: "USDT".into(),
+                lot_size: 0.001,
+                min_size: 0.002,
+                tick_size: 0.1,
+                max_leverage: 2.0,
+            });
+        let orders = manager.handle_signal(Signal {
+            venue: "okx".into(),
+            instrument: "BTC-USDT-SWAP".into(),
+            side: Side::Buy,
+            confidence: 1.0,
+            take_profit: 0.02,
+            stop_loss: 0.004,
+            price: 100.07,
+            ..Default::default()
+        });
+        assert_eq!(orders.len(), 1);
+        assert!((orders[0].price - 100.1).abs() < 1e-9);
+        assert_eq!(orders[0].settlement_currency, "USDT");
+        assert!(orders[0].leverage <= 2.0);
+        assert!(orders[0].quantity > 0.0);
+        assert!(orders[0].notional > 0.0);
+        assert!(orders[0].estimated_fee_value > 0.0);
+    }
+
+    #[test]
+    fn rejects_below_instrument_min_size() {
+        let mut config = production_position_manager_config();
+        config.position_size = 0.01;
+        config.min_expected_edge = 0.0;
+        config.min_order_delta = 0.0;
+        let mut manager = PositionManager::new(config);
+        manager.asset_manager_mut().update_asset(AssetSnapshot {
+            currency: "USDT".into(),
+            equity: 10.0,
+            ..Default::default()
+        });
+        manager
+            .instrument_manager_mut()
+            .update_instrument(InstrumentMetadata {
+                venue: "okx".into(),
+                instrument: "BTC-USDT-SWAP".into(),
+                settlement_currency: "USDT".into(),
+                lot_size: 0.001,
+                min_size: 1.0,
+                tick_size: 0.1,
+                max_leverage: 0.0,
+            });
+        let orders = manager.handle_signal(Signal {
+            venue: "okx".into(),
+            instrument: "BTC-USDT-SWAP".into(),
+            side: Side::Buy,
+            confidence: 1.0,
+            take_profit: 0.02,
+            stop_loss: 0.004,
+            price: 100.0,
+            ..Default::default()
+        });
+        assert!(orders.is_empty());
+    }
+
+    #[test]
+    fn stats_report_instrument_and_currency_pnl() {
+        let mut manager = PositionManager::new(production_position_manager_config());
+        manager.asset_manager_mut().update_asset(AssetSnapshot {
+            currency: "USDT".into(),
+            cash: 1000.0,
+            available: 800.0,
+            used: 200.0,
+            equity: 1000.0,
+        });
+        manager
+            .instrument_manager_mut()
+            .update_instrument(InstrumentMetadata {
+                venue: "okx".into(),
+                instrument: "ETH-USDT-SWAP".into(),
+                settlement_currency: "USDT".into(),
+                lot_size: 0.01,
+                min_size: 0.01,
+                tick_size: 0.01,
+                max_leverage: 0.0,
+            });
+        manager.add_position(Position {
+            venue: "okx".into(),
+            instrument: "ETH-USDT-SWAP".into(),
+            size: 0.10,
+            confidence: 0.8,
+            entry_price: 100.0,
+            last_price: 110.0,
+            leverage: 2.0,
+            realized_pnl: 0.01,
+            fees: 0.001,
+            ..Default::default()
+        });
+        let stats = manager.stats();
+        assert_eq!(stats.equity, 1000.0);
+        assert_eq!(stats.available, 800.0);
+        let instrument = stats.by_instrument.get("okx:ETH-USDT-SWAP").unwrap();
+        assert_eq!(instrument.settlement_currency, "USDT");
+        assert!(instrument.quantity > 0.0);
+        assert!(stats.total_pnl_percent > 0.0);
+    }
+}
