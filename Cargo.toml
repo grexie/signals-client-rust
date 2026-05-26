@@ -1,6 +1,6 @@
 [package]
 name = "grexie-signals-client"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Typed Rust client for Grexie Signals websocket subscriptions and position management."
 license = "MIT"

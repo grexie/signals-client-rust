@@ -390,6 +390,11 @@ impl InstrumentManager {
             })
     }
 
+    pub fn has_instrument(&self, venue: &str, instrument: &str) -> bool {
+        self.instruments
+            .contains_key(&position_key(venue, instrument))
+    }
+
     pub fn instruments(&self) -> Vec<InstrumentMetadata> {
         let mut instruments = self.instruments.values().cloned().collect::<Vec<_>>();
         instruments.sort_by(|a, b| (&a.venue, &a.instrument).cmp(&(&b.venue, &b.instrument)));
@@ -745,7 +750,10 @@ impl PositionManager {
     }
 
     pub fn handle_event(&mut self, event: &SignalsEvent) -> Vec<Order> {
-        if let SignalsEvent::Signal { signal, .. } = event {
+        if let SignalsEvent::Signal { signal, replay, .. } = event {
+            if *replay {
+                return Vec::new();
+            }
             self.handle_signal(signal.clone())
         } else {
             Vec::new()
@@ -754,6 +762,12 @@ impl PositionManager {
 
     pub fn handle_signal(&mut self, signal: Signal) -> Vec<Order> {
         if signal.venue.is_empty() || signal.instrument.is_empty() {
+            return Vec::new();
+        }
+        if !self
+            .instruments
+            .has_instrument(&signal.venue, &signal.instrument)
+        {
             return Vec::new();
         }
         let key = position_key(&signal.venue, &signal.instrument);
@@ -1225,6 +1239,16 @@ fn blend_risk(current: f64, incoming: f64, gate: f64) -> f64 {
 mod tests {
     use super::*;
 
+    fn configure_instrument(manager: &mut PositionManager, venue: &str, instrument: &str) {
+        manager
+            .instrument_manager_mut()
+            .update_instrument(InstrumentMetadata {
+                venue: venue.into(),
+                instrument: instrument.into(),
+                ..Default::default()
+            });
+    }
+
     #[test]
     fn parses_signal_replay_event() {
         let event = parse_event(r#"{"type":"signal","subscriptionId":4,"venue":"okx","instrument":"BTC-USDT-SWAP","timestamp":"2026-05-26T00:00:00Z","replay":true,"signal":{"confidence":0.8,"side":"buy","takeProfit":0.01,"stopLoss":0.004}}"#).unwrap();
@@ -1254,6 +1278,7 @@ mod tests {
         config.rebalance_interval = Duration::from_secs(3600);
         config.max_leverage = 5.0;
         let mut manager = PositionManager::new(config);
+        configure_instrument(&mut manager, "okx", "BTC-USDT-SWAP");
         let buy = manager.handle_signal(Signal {
             venue: "okx".into(),
             instrument: "BTC-USDT-SWAP".into(),
@@ -1293,6 +1318,7 @@ mod tests {
         config.min_expected_edge = 0.0;
         config.min_order_delta = 0.20;
         let mut manager = PositionManager::new(config);
+        configure_instrument(&mut manager, "okx", "DOGE-USDT-SWAP");
         let rejected = manager.handle_signal(Signal {
             venue: "okx".into(),
             instrument: "DOGE-USDT-SWAP".into(),
@@ -1315,6 +1341,100 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(accepted.len(), 1);
+    }
+
+    #[test]
+    fn ignores_unconfigured_signals() {
+        let mut config = production_position_manager_config();
+        config.position_size = 0.10;
+        config.min_expected_edge = 0.0;
+        config.min_order_delta = 0.0;
+        let mut manager = PositionManager::new(config);
+        let signal = Signal {
+            venue: "okx".into(),
+            instrument: "SOL-USDT-SWAP".into(),
+            side: Side::Buy,
+            confidence: 1.0,
+            take_profit: 0.02,
+            stop_loss: 0.004,
+            price: 100.0,
+            ..Default::default()
+        };
+        assert!(manager.handle_signal(signal.clone()).is_empty());
+        assert!(manager.positions().is_empty());
+        configure_instrument(&mut manager, "okx", "SOL-USDT-SWAP");
+        assert_eq!(manager.handle_signal(signal).len(), 1);
+    }
+
+    #[test]
+    fn ignores_replay_signal_events() {
+        let mut config = production_position_manager_config();
+        config.position_size = 0.10;
+        config.min_expected_edge = 0.0;
+        config.min_order_delta = 0.0;
+        let mut manager = PositionManager::new(config);
+        configure_instrument(&mut manager, "okx", "BTC-USDT-SWAP");
+        let mut event = SignalsEvent::Signal {
+            subscription_id: 3,
+            venue: "okx".into(),
+            instrument: "BTC-USDT-SWAP".into(),
+            signal: Signal {
+                venue: "okx".into(),
+                instrument: "BTC-USDT-SWAP".into(),
+                side: Side::Buy,
+                confidence: 1.0,
+                take_profit: 0.02,
+                stop_loss: 0.004,
+                price: 100.0,
+                ..Default::default()
+            },
+            timestamp: None,
+            replay: true,
+            replayed_at: None,
+        };
+        assert!(manager.handle_event(&event).is_empty());
+        assert!(manager.positions().is_empty());
+        if let SignalsEvent::Signal { replay, .. } = &mut event {
+            *replay = false;
+        }
+        assert_eq!(manager.handle_event(&event).len(), 1);
+    }
+
+    #[test]
+    fn leverage_adapts_with_confidence_edge_and_score_inside_caps() {
+        fn leverage_for(instrument: &str, confidence: f64, take_profit: f64, score: f64) -> f64 {
+            let mut config = production_position_manager_config();
+            config.position_size = 1.0;
+            config.min_expected_edge = 0.0;
+            config.min_order_delta = 0.0;
+            config.min_leverage = 1.0;
+            config.max_leverage = 5.0;
+            let mut manager = PositionManager::new(config);
+            configure_instrument(&mut manager, "okx", instrument);
+            manager
+                .handle_signal(Signal {
+                    venue: "okx".into(),
+                    instrument: instrument.into(),
+                    side: Side::Buy,
+                    confidence,
+                    take_profit,
+                    stop_loss: 0.0,
+                    score,
+                    price: 100.0,
+                    ..Default::default()
+                })
+                .first()
+                .unwrap()
+                .leverage
+        }
+
+        let low = leverage_for("LOW-USDT-SWAP", 0.2, 0.0, 0.0);
+        let scored = leverage_for("SCORE-USDT-SWAP", 0.2, 0.0, 1.0);
+        let high = leverage_for("HIGH-USDT-SWAP", 1.0, 0.02, 1.0);
+        assert!(low >= 1.0);
+        assert!(high <= 5.0);
+        assert!(scored > low);
+        assert!((high - 5.0).abs() < 1e-9);
     }
 
     #[test]
