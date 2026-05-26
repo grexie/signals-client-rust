@@ -74,6 +74,46 @@ pub struct Signal {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub components: Vec<SignalComponent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_variant: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prediction_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence_mapping: Option<String>,
+    #[serde(default)]
+    pub up_probability: f64,
+    #[serde(default)]
+    pub down_probability: f64,
+    #[serde(default)]
+    pub directional_edge: f64,
+    #[serde(default)]
+    pub normalized_edge: f64,
+    #[serde(default)]
+    pub expected_value: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regime: Option<String>,
+    #[serde(default)]
+    pub regime_confidence: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volatility_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub squeeze_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trend_state: Option<String>,
+    #[serde(default)]
+    pub atr_percent: f64,
+    #[serde(default)]
+    pub signal_ttl: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejected_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<String>,
     #[serde(default)]
     pub price: f64,
@@ -509,6 +549,7 @@ pub struct Order {
     pub leverage: f64,
     pub take_profit: f64,
     pub stop_loss: f64,
+    pub reduce_only: bool,
 }
 
 /// Closed realized trade snapshot.
@@ -1319,6 +1360,7 @@ impl PositionManager {
             executable_abs_delta = requested_abs_delta;
         }
         let executable_delta = sign(delta) * executable_abs_delta;
+        let reduce_only = is_exposure_reduction(position.size, position.size + executable_delta);
         Order {
             venue: position.venue.clone(),
             instrument: position.instrument.clone(),
@@ -1343,6 +1385,7 @@ impl PositionManager {
             leverage,
             take_profit: 0.0,
             stop_loss: 0.0,
+            reduce_only,
         }
     }
 
