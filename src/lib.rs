@@ -395,6 +395,8 @@ pub struct InstrumentMetadata {
     pub lot_size: f64,
     pub min_size: f64,
     pub tick_size: f64,
+    pub contract_value: f64,
+    pub contract_multiplier: f64,
     pub max_leverage: f64,
 }
 
@@ -445,14 +447,18 @@ impl InstrumentManager {
 /// Fee-aware position manager configuration.
 #[derive(Debug, Clone)]
 pub struct PositionManagerConfig {
+    pub max_margin_ratio: f64,
     pub position_size: f64,
     pub min_expected_edge: f64,
     pub min_order_delta: f64,
+    pub min_position_size_ratio: f64,
     pub rebalance_interval: Duration,
     pub maker_fee_rate: f64,
     pub taker_fee_rate: f64,
     pub min_leverage: f64,
     pub max_leverage: f64,
+    pub available_margin_buffer: f64,
+    pub executable_margin_buffer: f64,
     pub instruments: HashMap<String, InstrumentConfig>,
 }
 
@@ -465,14 +471,18 @@ impl Default for PositionManagerConfig {
 /// Returns the same execution-policy defaults used by the Grexie Signals server.
 pub fn production_position_manager_config() -> PositionManagerConfig {
     PositionManagerConfig {
-        position_size: 1.0,
+        max_margin_ratio: 1.0,
+        position_size: 0.0,
         min_expected_edge: 0.0045,
         min_order_delta: 0.20,
+        min_position_size_ratio: 0.01,
         rebalance_interval: Duration::from_secs(6 * 60 * 60),
         maker_fee_rate: 0.0002,
         taker_fee_rate: 0.0005,
         min_leverage: 1.0,
         max_leverage: 1.0,
+        available_margin_buffer: 0.10,
+        executable_margin_buffer: 0.001,
         instruments: HashMap::new(),
     }
 }
@@ -508,7 +518,7 @@ impl Position {
     }
 
     pub fn unrealized_pnl(&self) -> f64 {
-        self.price_move() * self.size.abs()
+        self.price_move() * self.size.abs() * positive_or(self.entry_price, 1.0, 0.0)
     }
 
     fn price_move(&self) -> f64 {
@@ -540,6 +550,7 @@ pub struct Order {
     pub fee_rate: f64,
     pub estimated_fee: f64,
     pub estimated_fee_value: f64,
+    pub margin: f64,
     pub quantity: f64,
     pub notional: f64,
     pub settlement_currency: String,
@@ -651,6 +662,11 @@ impl PositionManager {
     }
 
     pub fn add_position(&mut self, position: Position) {
+        let mut position = position;
+        if position.leverage <= 0.0 {
+            let key = position_key(&position.venue, &position.instrument);
+            position.leverage = self.min_leverage(&key);
+        }
         self.positions.insert(
             position_key(&position.venue, &position.instrument),
             position,
@@ -659,6 +675,16 @@ impl PositionManager {
 
     pub fn update_position(&mut self, position: Position) {
         self.add_position(position);
+    }
+
+    pub fn replace_positions(&mut self, positions: Vec<Position>) {
+        self.positions.clear();
+        for position in positions {
+            if position.venue.is_empty() || position.instrument.is_empty() || position.size.abs() <= 1e-9 {
+                continue;
+            }
+            self.add_position(position);
+        }
     }
 
     pub fn close_position(&mut self, venue: &str, instrument: &str) -> Vec<Order> {
@@ -724,26 +750,28 @@ impl PositionManager {
                 .instrument(&position.venue, &position.instrument);
             let asset = self.assets.asset(&metadata.settlement_currency);
             let equity = positive_or(
-                asset.map(|a| a.equity).unwrap_or(0.0),
-                asset.map(|a| a.cash + a.used).unwrap_or(0.0),
+                positive_or(
+                    asset.map(|a| a.equity).unwrap_or(0.0),
+                    asset.map(|a| a.cash + a.used).unwrap_or(0.0),
+                    asset.map(|a| a.cash).unwrap_or(0.0),
+                ),
                 1.0,
+                0.0,
             );
             let price = round_to_tick(
                 positive_or(position.last_price, position.entry_price, 0.0),
                 metadata.tick_size,
             );
-            let notional_raw = position.size.abs()
-                * equity
-                * positive_or(position.leverage, self.min_leverage(key), 1.0);
-            let quantity = if price > 0.0 {
-                round_down_to_step(notional_raw / price, metadata.lot_size)
+            let contract_notional = instrument_contract_notional(price, &metadata);
+            let quantity = if contract_notional > 0.0 {
+                round_down_to_step(position.size.abs(), metadata.lot_size)
             } else {
-                0.0
+                position.size.abs()
             };
-            let notional = quantity * price;
-            let realized = position.realized_pnl * equity;
-            let unrealized = position.unrealized_pnl() * equity;
-            let fees = position.fees * equity;
+            let notional = quantity * contract_notional;
+            let realized = position.realized_pnl;
+            let unrealized = self.position_unrealized_pnl(key, position);
+            let fees = position.fees;
             stats.by_instrument.insert(
                 key.clone(),
                 InstrumentPositionStats {
@@ -757,9 +785,9 @@ impl PositionManager {
                     realized_pnl: realized,
                     unrealized_pnl: unrealized,
                     fees,
-                    realized_pnl_percent: position.realized_pnl,
-                    unrealized_pnl_percent: position.unrealized_pnl(),
-                    total_pnl_percent: position.realized_pnl + position.unrealized_pnl(),
+                    realized_pnl_percent: ratio_or_zero(position.realized_pnl, equity),
+                    unrealized_pnl_percent: ratio_or_zero(unrealized, equity),
+                    total_pnl_percent: ratio_or_zero(position.realized_pnl + unrealized, equity),
                     leverage: position.leverage,
                 },
             );
@@ -824,14 +852,20 @@ impl PositionManager {
         if self.config.min_expected_edge > 0.0 && edge < self.config.min_expected_edge {
             return Vec::new();
         }
-        let target_size = target_sign * self.config.position_size;
+        let portfolio_budget = self.max_portfolio_margin_budget();
         let min_order_delta = self.effective_min_order_delta();
         let now = SystemTime::now();
         let leverage = self.select_leverage(&key, target_confidence, edge, signal.score);
-        let position = self
+        let empty_position = self
             .positions
-            .entry(key.clone())
-            .or_insert_with(|| Position {
+            .get(&key)
+            .map(|position| position.size.abs() <= 1e-9)
+            .unwrap_or(true);
+        if empty_position && (portfolio_budget < min_order_delta || !self.meets_minimum_position_size(portfolio_budget)) {
+            return Vec::new();
+        }
+        if !self.positions.contains_key(&key) {
+            self.positions.insert(key.clone(), Position {
                 venue: signal.venue.clone(),
                 instrument: signal.instrument.clone(),
                 entry_price: signal.price,
@@ -839,9 +873,10 @@ impl PositionManager {
                 opened_at: Some(now),
                 ..Default::default()
             });
-        if position.size.abs() <= 1e-9 && target_size.abs() < min_order_delta {
-            return Vec::new();
         }
+        let Some(position) = self.positions.get_mut(&key) else {
+            return Vec::new();
+        };
         let is_flip = sign(position.size) != 0.0 && sign(position.size) != target_sign;
         if !is_flip && position.size.abs() > 1e-9 {
             if let Some(last_signal_at) = position.last_signal_at {
@@ -851,9 +886,6 @@ impl PositionManager {
                 {
                     return Vec::new();
                 }
-            }
-            if min_order_delta > 0.0 && (target_size - position.size).abs() < min_order_delta {
-                return Vec::new();
             }
         }
         position.confidence = target_confidence;
@@ -895,13 +927,17 @@ impl PositionManager {
         side_overrides: HashMap<String, f64>,
         contexts: HashMap<String, SignalContext>,
     ) -> Vec<Order> {
+        let portfolio_budget = self.max_portfolio_margin_budget();
+        if portfolio_budget <= 0.0 || self.positions.is_empty() {
+            return Vec::new();
+        }
         let mut weights = HashMap::new();
         let mut sides = HashMap::new();
         for (key, position) in &self.positions {
             let has_override = side_overrides.contains_key(key);
             let mut weight = clamp01(position.confidence);
             if !has_override && weight <= 0.0 {
-                weight = confidence_from_size(position, self.config.position_size);
+                weight = clamp01(self.position_margin(key, position) / portfolio_budget);
             }
             let mut side = sign(position.size);
             if let Some(override_side) = side_overrides.get(key) {
@@ -931,6 +967,15 @@ impl PositionManager {
                 }
                 continue;
             }
+            if target_size != 0.0
+                && !self.meets_minimum_position_size(self.margin_for_quantity(&key, &position, target_size))
+                && !is_exposure_reduction(position.size, target_size)
+            {
+                if let Some(current) = self.positions.get_mut(&key) {
+                    current.confidence = weight;
+                }
+                continue;
+            }
             let is_flip = position.size.abs() > 1e-9
                 && target_size.abs() > 1e-9
                 && !same_sign(position.size, target_size);
@@ -939,7 +984,7 @@ impl PositionManager {
             if !is_flip
                 && !is_opening
                 && !is_closing
-                && delta.abs() < self.effective_min_order_delta()
+                && self.margin_for_quantity(&key, &position, delta) < self.effective_min_order_delta()
             {
                 if let Some(current) = self.positions.get_mut(&key) {
                     current.confidence = weight;
@@ -975,7 +1020,8 @@ impl PositionManager {
         contexts: &HashMap<String, SignalContext>,
     ) -> HashMap<String, f64> {
         let mut targets = HashMap::new();
-        if self.config.position_size <= 0.0 {
+        let portfolio_budget = self.max_portfolio_margin_budget();
+        if portfolio_budget <= 0.0 {
             return targets;
         }
         let mut active = HashMap::<String, ()>::new();
@@ -1002,7 +1048,7 @@ impl PositionManager {
                     continue;
                 };
                 let desired_budget =
-                    self.config.position_size * *weights.get(key).unwrap_or(&0.0) / total_weight;
+                    portfolio_budget * *weights.get(key).unwrap_or(&0.0) / total_weight;
                 if self
                     .executable_allocation_for_budget(
                         key,
@@ -1049,19 +1095,22 @@ impl PositionManager {
             };
             let context = *contexts.get(key).unwrap_or(&SignalContext::default());
             let desired_budget =
-                self.config.position_size * *weights.get(key).unwrap_or(&0.0) / total_weight;
+                portfolio_budget * *weights.get(key).unwrap_or(&0.0) / total_weight;
             let executable =
                 self.executable_allocation_for_budget(key, position, desired_budget, context);
             if executable.margin <= 1e-9 {
                 continue;
             }
+            if !self.meets_minimum_position_size(executable.margin) {
+                continue;
+            }
             targets.insert(
                 key.clone(),
-                *sides.get(key).unwrap_or(&0.0) * executable.margin,
+                *sides.get(key).unwrap_or(&0.0) * executable.quantity,
             );
             allocated += executable.margin + executable.fee;
         }
-        let mut free = self.config.position_size - allocated;
+        let mut free = portfolio_budget - allocated;
         if free <= 1e-9 {
             return targets;
         }
@@ -1084,16 +1133,28 @@ impl PositionManager {
             let step = self.executable_lot_step_cost(&key, position, context);
             let step_cost = step.margin + step.fee;
             if step_cost <= 1e-9 {
-                *targets.entry(key.clone()).or_insert(0.0) +=
-                    *sides.get(&key).unwrap_or(&0.0) * free;
+                let executable = self.executable_allocation_for_budget(&key, position, free, context);
+                if executable.quantity > 1e-9 && self.meets_minimum_position_size(executable.margin) {
+                    *targets.entry(key.clone()).or_insert(0.0) +=
+                        *sides.get(&key).unwrap_or(&0.0) * executable.quantity;
+                }
                 break;
             }
             let steps = ((free + 1e-9) / step_cost).floor();
             if steps <= 0.0 {
                 continue;
             }
-            *targets.entry(key.clone()).or_insert(0.0) +=
-                *sides.get(&key).unwrap_or(&0.0) * steps * step.margin;
+            let next = *targets.get(&key).unwrap_or(&0.0)
+                + *sides.get(&key).unwrap_or(&0.0) * steps * step.quantity;
+            let next_margin = if step.quantity > 0.0 {
+                next.abs() * step.margin / step.quantity
+            } else {
+                0.0
+            };
+            if !self.meets_minimum_position_size(next_margin) {
+                continue;
+            }
+            targets.insert(key.clone(), next);
             free -= steps * step_cost;
         }
         targets
@@ -1185,30 +1246,96 @@ impl PositionManager {
         let Some(asset) = self.assets.asset(currency) else {
             return portfolio_budget;
         };
-        let equity = positive_or(asset.equity, asset.cash + asset.used, asset.cash);
-        if equity <= 0.0 {
-            return if asset.available > 0.0 {
-                portfolio_budget
-            } else {
-                0.0
-            };
-        }
         if asset.available <= 0.0 {
             return 0.0;
         }
-        (asset.available / equity).max(0.0).min(portfolio_budget)
+        let mut budget = asset.available.max(0.0);
+        if self.config.available_margin_buffer > 0.0 {
+            budget *= 1.0 - self.config.available_margin_buffer;
+        }
+        budget.min(portfolio_budget)
     }
 
     fn available_portfolio_budget(&self) -> f64 {
-        if self.config.position_size <= 0.0 {
-            return 0.0;
-        }
+        let max_budget = self.max_portfolio_margin_budget();
         let used = self
             .positions
-            .values()
-            .map(|position| position.size.abs())
+            .iter()
+            .map(|(key, position)| self.position_margin(key, position))
             .sum::<f64>();
-        (self.config.position_size - used).max(0.0)
+        (max_budget - used).max(0.0)
+    }
+
+    fn max_portfolio_margin_budget(&self) -> f64 {
+        let capital = self.portfolio_capital();
+        if capital <= 0.0 || self.config.max_margin_ratio <= 0.0 {
+            0.0
+        } else {
+            capital * self.config.max_margin_ratio
+        }
+    }
+
+    fn portfolio_capital(&self) -> f64 {
+        let capital = self
+            .assets
+            .assets()
+            .iter()
+            .map(|asset| positive_or(asset.equity, asset.cash + asset.used, asset.cash))
+            .sum::<f64>();
+        if capital > 0.0 { capital } else { 1.0 }
+    }
+
+    fn position_margin(&self, key: &str, position: &Position) -> f64 {
+        if position.size.abs() <= 1e-9 {
+            0.0
+        } else {
+            self.margin_for_quantity(key, position, position.size)
+        }
+    }
+
+    fn margin_for_quantity(&self, key: &str, position: &Position, quantity: f64) -> f64 {
+        if quantity.abs() <= 1e-9 {
+            return 0.0;
+        }
+        let metadata = self.instruments.instrument(&position.venue, &position.instrument);
+        let price = round_to_tick(positive_or(position.last_price, position.entry_price, 0.0), metadata.tick_size);
+        let contract_notional = instrument_contract_notional(price, &metadata);
+        let leverage = positive_or(position.leverage, self.min_leverage(key), 1.0);
+        if contract_notional <= 0.0 || leverage <= 0.0 {
+            return 0.0;
+        }
+        quantity.abs() * contract_notional / leverage
+    }
+
+    fn position_unrealized_pnl(&self, key: &str, position: &Position) -> f64 {
+        if position.size.abs() <= 1e-9 || position.entry_price <= 0.0 || position.last_price <= 0.0 {
+            0.0
+        } else {
+            self.realized_gross_for_quantity(key, position, position.size.abs(), position.last_price)
+        }
+    }
+
+    fn realized_gross_for_quantity(&self, _key: &str, position: &Position, quantity: f64, exit_price: f64) -> f64 {
+        if quantity <= 1e-9 || position.entry_price <= 0.0 || exit_price <= 0.0 {
+            return 0.0;
+        }
+        let metadata = self.instruments.instrument(&position.venue, &position.instrument);
+        let contract_value = positive_or(metadata.contract_value, 1.0, 0.0);
+        let contract_multiplier = positive_or(metadata.contract_multiplier, 1.0, 0.0);
+        let price_move = if position.size < 0.0 {
+            position.entry_price - exit_price
+        } else {
+            exit_price - position.entry_price
+        };
+        price_move * quantity * contract_value * contract_multiplier
+    }
+
+    fn fee_for_quantity(&self, _key: &str, position: &Position, quantity: f64, price: f64, fee_rate: f64) -> f64 {
+        if quantity <= 1e-9 || price <= 0.0 || fee_rate <= 0.0 {
+            return 0.0;
+        }
+        let metadata = self.instruments.instrument(&position.venue, &position.instrument);
+        quantity * instrument_contract_notional(price, &metadata) * fee_rate
     }
 
     fn executable_allocation_for_budget(
@@ -1224,12 +1351,6 @@ impl PositionManager {
         let metadata = self
             .instruments
             .instrument(&position.venue, &position.instrument);
-        let asset = self.assets.asset(&metadata.settlement_currency);
-        let equity = positive_or(
-            asset.map(|a| a.equity).unwrap_or(0.0),
-            asset.map(|a| a.cash + a.used).unwrap_or(0.0),
-            1.0,
-        );
         let price = round_to_tick(
             positive_or(position.last_price, position.entry_price, 0.0),
             metadata.tick_size,
@@ -1240,26 +1361,34 @@ impl PositionManager {
             context.expected_edge,
             context.score,
         );
-        if price <= 0.0 || equity <= 0.0 || leverage <= 0.0 {
+        let contract_notional = instrument_contract_notional(price, &metadata);
+        if contract_notional <= 0.0 || leverage <= 0.0 {
             return ExecutableAllocation::default();
         }
         let fee_rate = self.taker_fee_rate(key);
-        let fee_multiplier = (1.0 + leverage * fee_rate).max(1.0);
-        let max_margin = budget / fee_multiplier;
-        let quantity =
-            round_down_to_step(max_margin * equity * leverage / price, metadata.lot_size);
-        if quantity <= 1e-9 {
-            return ExecutableAllocation::default();
+        let mut max_margin = budget;
+        if metadata.lot_size <= 0.0 {
+            let fee_multiplier = 1.0 + leverage * fee_rate;
+            if fee_multiplier > 0.0 {
+                max_margin = budget / fee_multiplier;
+            }
         }
-        if metadata.min_size > 0.0 && quantity < metadata.min_size {
-            return ExecutableAllocation::default();
+        let mut quantity = round_down_to_step(max_margin * leverage / contract_notional, metadata.lot_size);
+        while quantity > 1e-9 {
+            if metadata.min_size > 0.0 && quantity < metadata.min_size {
+                return ExecutableAllocation::default();
+            }
+            let margin = quantity * contract_notional / leverage;
+            let fee = quantity * contract_notional * fee_rate;
+            if margin + fee <= budget + 1e-9 {
+                return ExecutableAllocation { quantity, margin, fee };
+            }
+            if metadata.lot_size <= 0.0 {
+                return ExecutableAllocation::default();
+            }
+            quantity = round_down_to_step(quantity - metadata.lot_size, metadata.lot_size);
         }
-        let margin = quantity * price / (equity * leverage);
-        let fee = quantity * price * fee_rate / equity;
-        if margin + fee > budget + 1e-9 {
-            return ExecutableAllocation::default();
-        }
-        ExecutableAllocation { margin, fee }
+        ExecutableAllocation::default()
     }
 
     fn executable_lot_step_cost(
@@ -1274,12 +1403,6 @@ impl PositionManager {
         if metadata.lot_size <= 0.0 {
             return ExecutableAllocation::default();
         }
-        let asset = self.assets.asset(&metadata.settlement_currency);
-        let equity = positive_or(
-            asset.map(|a| a.equity).unwrap_or(0.0),
-            asset.map(|a| a.cash + a.used).unwrap_or(0.0),
-            1.0,
-        );
         let price = round_to_tick(
             positive_or(position.last_price, position.entry_price, 0.0),
             metadata.tick_size,
@@ -1290,12 +1413,14 @@ impl PositionManager {
             context.expected_edge,
             context.score,
         );
-        if price <= 0.0 || equity <= 0.0 || leverage <= 0.0 {
+        let contract_notional = instrument_contract_notional(price, &metadata);
+        if contract_notional <= 0.0 || leverage <= 0.0 {
             return ExecutableAllocation::default();
         }
         ExecutableAllocation {
-            margin: metadata.lot_size * price / (equity * leverage),
-            fee: metadata.lot_size * price * self.taker_fee_rate(key) / equity,
+            quantity: metadata.lot_size,
+            margin: metadata.lot_size * contract_notional / leverage,
+            fee: metadata.lot_size * contract_notional * self.taker_fee_rate(key),
         }
     }
 
@@ -1314,8 +1439,11 @@ impl PositionManager {
         if executable.margin <= 1e-9 {
             return 0.0;
         }
-        if executable.margin < delta.abs() {
-            return sign(delta) * executable.margin;
+        if !self.meets_minimum_position_size(executable.margin) {
+            return 0.0;
+        }
+        if executable.quantity < delta.abs() {
+            return self.cap_executable_delta_with_buffered_cost(key, position, sign(delta) * executable.quantity, context, budget);
         }
         let order = self.order_for_delta(
             key,
@@ -1327,9 +1455,64 @@ impl PositionManager {
             context.confidence,
         );
         if order_budget_cost(&order) > budget + 1e-9 {
-            return sign(delta) * executable.margin;
+            return self.cap_executable_delta_with_buffered_cost(key, position, sign(delta) * executable.quantity, context, budget);
         }
         delta
+    }
+
+    fn cap_executable_delta_with_buffered_cost(
+        &self,
+        key: &str,
+        position: &Position,
+        delta: f64,
+        context: SignalContext,
+        budget: f64,
+    ) -> f64 {
+        if delta.abs() <= 1e-9 || budget <= 1e-9 {
+            return 0.0;
+        }
+        let metadata = self.instruments.instrument(&position.venue, &position.instrument);
+        let quantity_step = if metadata.lot_size > 0.0 { metadata.lot_size } else { 0.0 };
+        let mut candidate = delta.abs();
+        while candidate > 1e-9 {
+            let order = self.order_for_delta(key, position, sign(delta) * candidate, context.expected_edge, context.score, "budget-check", context.confidence);
+            if order_budget_cost(&order) <= budget + 1e-9 {
+                return sign(delta) * candidate;
+            }
+            if quantity_step <= 1e-9 {
+                return self.cap_continuous_opening_delta_to_budget(key, position, delta, context, budget);
+            }
+            candidate -= quantity_step;
+        }
+        0.0
+    }
+
+    fn cap_continuous_opening_delta_to_budget(
+        &self,
+        key: &str,
+        position: &Position,
+        delta: f64,
+        context: SignalContext,
+        budget: f64,
+    ) -> f64 {
+        if delta.abs() <= 1e-9 || budget <= 1e-9 {
+            return 0.0;
+        }
+        let mut low = 0.0;
+        let mut high = delta.abs();
+        for _ in 0..64 {
+            let mid = (low + high) / 2.0;
+            if mid <= 1e-9 {
+                break;
+            }
+            let order = self.order_for_delta(key, position, sign(delta) * mid, context.expected_edge, context.score, "budget-check", context.confidence);
+            if order_budget_cost(&order) <= budget + 1e-9 {
+                low = mid;
+            } else {
+                high = mid;
+            }
+        }
+        if low <= 1e-9 { 0.0 } else { sign(delta) * low }
     }
 
     fn order_for_delta(
@@ -1346,33 +1529,21 @@ impl PositionManager {
         let metadata = self
             .instruments
             .instrument(&position.venue, &position.instrument);
-        let asset = self.assets.asset(&metadata.settlement_currency);
         let leverage = self.select_leverage(key, confidence, edge, score);
-        let equity = positive_or(
-            asset.map(|a| a.equity).unwrap_or(0.0),
-            asset.map(|a| a.cash + a.used).unwrap_or(0.0),
-            1.0,
-        );
         let price = round_to_tick(
             positive_or(position.last_price, position.entry_price, 0.0),
             metadata.tick_size,
         );
         let requested_abs_delta = delta.abs();
-        let mut notional = requested_abs_delta * equity * leverage;
-        let quantity = if price > 0.0 {
-            round_down_to_step(notional / price, metadata.lot_size)
+        let contract_notional = instrument_contract_notional(price, &metadata);
+        let quantity = if contract_notional > 0.0 {
+            round_down_to_step(requested_abs_delta, metadata.lot_size)
         } else {
             0.0
         };
-        notional = quantity * price;
-        let mut executable_abs_delta = requested_abs_delta;
-        if equity > 0.0 && leverage > 0.0 && price > 0.0 {
-            executable_abs_delta = notional / (equity * leverage);
-        }
-        if executable_abs_delta > requested_abs_delta {
-            executable_abs_delta = requested_abs_delta;
-        }
-        let executable_delta = sign(delta) * executable_abs_delta;
+        let notional = quantity * contract_notional;
+        let margin = if leverage > 0.0 { notional / leverage } else { 0.0 };
+        let executable_delta = sign(delta) * quantity;
         let reduce_only = is_exposure_reduction(position.size, position.size + executable_delta);
         Order {
             venue: position.venue.clone(),
@@ -1387,8 +1558,9 @@ impl PositionManager {
             score,
             expected_edge: edge,
             fee_rate,
-            estimated_fee: fee_exposure_for_notional(notional, fee_rate, equity),
+            estimated_fee: fee_value_for_notional(notional, fee_rate),
             estimated_fee_value: notional * fee_rate,
+            margin,
             quantity,
             notional,
             settlement_currency: metadata.settlement_currency,
@@ -1418,11 +1590,7 @@ impl PositionManager {
                     };
                 position.last_price = price;
             }
-            let fee = fee_exposure_for_margin(
-                delta.abs(),
-                positive_or(position.leverage, self.min_leverage(key), 1.0),
-                fee_rate,
-            );
+            let fee = self.fee_for_quantity(key, &position, delta.abs(), price, fee_rate);
             position.fees += fee;
             position.realized_pnl -= fee;
             position.size += delta;
@@ -1433,12 +1601,8 @@ impl PositionManager {
             position.last_price = price;
         }
         let closing = position.size.abs().min(delta.abs());
-        let gross = position.price_move() * closing;
-        let fee = fee_exposure_for_margin(
-            closing,
-            positive_or(position.leverage, self.min_leverage(key), 1.0),
-            fee_rate,
-        );
+        let gross = self.realized_gross_for_quantity(key, &position, closing, price);
+        let fee = self.fee_for_quantity(key, &position, closing, price, fee_rate);
         position.realized_gross += gross;
         position.fees += fee;
         position.realized_pnl += gross - fee;
@@ -1469,17 +1633,26 @@ impl PositionManager {
         position.last_price = price;
         position.confidence = 0.0;
         position.realized_gross = 0.0;
-        position.fees = fee_exposure_for_margin(
-            remaining,
-            positive_or(position.leverage, self.min_leverage(key), 1.0),
-            fee_rate,
-        );
+        position.fees = self.fee_for_quantity(key, &position, remaining, price, fee_rate);
         position.realized_pnl = -position.fees;
         self.positions.insert(key.to_string(), position);
     }
 
     fn effective_min_order_delta(&self) -> f64 {
-        self.config.min_order_delta.max(0.0) * self.config.position_size.max(0.0)
+        self.config.min_order_delta.max(0.0) * self.max_portfolio_margin_budget()
+    }
+
+    fn minimum_position_size(&self) -> f64 {
+        if self.config.min_position_size_ratio <= 0.0 {
+            0.0
+        } else {
+            self.config.min_position_size_ratio * self.portfolio_capital()
+        }
+    }
+
+    fn meets_minimum_position_size(&self, size: f64) -> bool {
+        let minimum = self.minimum_position_size();
+        minimum <= 0.0 || size.abs() + 1e-9 >= minimum
     }
 
     fn select_leverage(&self, key: &str, confidence: f64, edge: f64, score: f64) -> f64 {
@@ -1561,18 +1734,30 @@ struct RebalanceCandidate {
 
 #[derive(Debug, Clone, Copy, Default)]
 struct ExecutableAllocation {
+    quantity: f64,
     margin: f64,
     fee: f64,
 }
 
 fn normalize_config(mut config: PositionManagerConfig) -> PositionManagerConfig {
-    config.position_size = config.position_size.clamp(0.0, 1.0);
+    if config.max_margin_ratio <= 0.0 {
+        if config.position_size > 0.0 && config.position_size <= 1.0 {
+            config.max_margin_ratio = config.position_size;
+        } else {
+            config.max_margin_ratio = 1.0;
+        }
+    }
+    config.max_margin_ratio = config.max_margin_ratio.clamp(0.0, 1.0);
+    config.position_size = config.position_size.max(0.0);
     config.min_expected_edge = config.min_expected_edge.max(0.0);
     config.min_order_delta = config.min_order_delta.clamp(0.0, 1.0);
+    config.min_position_size_ratio = config.min_position_size_ratio.clamp(0.0, 1.0);
     config.maker_fee_rate = config.maker_fee_rate.max(0.0);
     config.taker_fee_rate = config.taker_fee_rate.max(0.0);
     config.min_leverage = config.min_leverage.max(0.0);
     config.max_leverage = config.max_leverage.max(0.0);
+    config.available_margin_buffer = config.available_margin_buffer.clamp(0.0, 0.95);
+    config.executable_margin_buffer = config.executable_margin_buffer.clamp(0.0, 0.05);
     config
 }
 
@@ -1605,14 +1790,6 @@ fn clamp01(value: f64) -> f64 {
     value.clamp(0.0, 1.0)
 }
 
-fn confidence_from_size(position: &Position, position_size: f64) -> f64 {
-    if position_size <= 0.0 {
-        clamp01(position.size.abs())
-    } else {
-        clamp01(position.size.abs() / position_size)
-    }
-}
-
 fn expected_edge(signal: &Signal) -> f64 {
     clamp01(signal.confidence) * signal.take_profit.max(0.0)
         - (1.0 - clamp01(signal.confidence)) * signal.stop_loss.max(0.0)
@@ -1623,23 +1800,26 @@ fn fee_adjusted_expected_edge(signal: &Signal, taker_fee_rate: f64) -> f64 {
 }
 
 fn order_budget_cost(order: &Order) -> f64 {
-    order.size_delta.abs() + order.estimated_fee.max(0.0)
+    order.margin.max(0.0) + order.estimated_fee.max(0.0)
 }
 
-fn fee_exposure_for_notional(notional: f64, fee_rate: f64, equity: f64) -> f64 {
-    if notional <= 0.0 || fee_rate <= 0.0 || equity <= 0.0 {
+fn fee_value_for_notional(notional: f64, fee_rate: f64) -> f64 {
+    if notional <= 0.0 || fee_rate <= 0.0 {
         0.0
     } else {
-        notional * fee_rate / equity
+        notional * fee_rate
     }
 }
 
-fn fee_exposure_for_margin(margin: f64, leverage: f64, fee_rate: f64) -> f64 {
-    if margin <= 0.0 || leverage <= 0.0 || fee_rate <= 0.0 {
-        0.0
-    } else {
-        margin * leverage * fee_rate
+fn instrument_contract_notional(price: f64, metadata: &InstrumentMetadata) -> f64 {
+    if price <= 0.0 {
+        return 0.0;
     }
+    price * positive_or(metadata.contract_value, 1.0, 0.0) * positive_or(metadata.contract_multiplier, 1.0, 0.0)
+}
+
+fn ratio_or_zero(numerator: f64, denominator: f64) -> f64 {
+    if denominator > 0.0 { numerator / denominator } else { 0.0 }
 }
 
 fn order_reason(position: &Position, target_size: f64) -> &'static str {
@@ -1749,7 +1929,7 @@ mod tests {
     #[test]
     fn position_manager_opens_and_flips() {
         let mut config = production_position_manager_config();
-        config.position_size = 0.10;
+        config.max_margin_ratio = 0.10;
         config.min_expected_edge = 0.0;
         config.min_order_delta = 0.20;
         config.rebalance_interval = Duration::from_secs(3600);
@@ -1807,7 +1987,7 @@ mod tests {
     #[test]
     fn confidence_is_allocation_weight() {
         let mut config = production_position_manager_config();
-        config.position_size = 0.10;
+        config.max_margin_ratio = 0.10;
         config.min_expected_edge = 0.0;
         config.min_order_delta = 0.20;
         let mut manager = PositionManager::new(config);
@@ -1829,7 +2009,7 @@ mod tests {
     #[test]
     fn quantizes_emitted_target_size_to_executable_lots() {
         let mut config = production_position_manager_config();
-        config.position_size = 0.50;
+        config.max_margin_ratio = 0.50;
         config.min_expected_edge = 0.0;
         config.min_order_delta = 0.0;
         let mut manager = PositionManager::new(config);
@@ -1862,14 +2042,14 @@ mod tests {
         });
         assert_eq!(orders.len(), 1);
         assert!((orders[0].quantity - 1.0).abs() < 1e-9);
-        assert!((orders[0].size_delta - 0.333).abs() < 1e-9);
-        assert!((orders[0].target_size - 0.333).abs() < 1e-9);
+        assert!((orders[0].size_delta - 1.0).abs() < 1e-9);
+        assert!((orders[0].target_size - 1.0).abs() < 1e-9);
     }
 
     #[test]
     fn ignores_unconfigured_signals() {
         let mut config = production_position_manager_config();
-        config.position_size = 0.10;
+        config.max_margin_ratio = 0.10;
         config.min_expected_edge = 0.0;
         config.min_order_delta = 0.0;
         let mut manager = PositionManager::new(config);
@@ -1892,7 +2072,7 @@ mod tests {
     #[test]
     fn ignores_replay_signal_events() {
         let mut config = production_position_manager_config();
-        config.position_size = 0.10;
+        config.max_margin_ratio = 0.10;
         config.min_expected_edge = 0.0;
         config.min_order_delta = 0.0;
         let mut manager = PositionManager::new(config);
@@ -1927,7 +2107,7 @@ mod tests {
     fn leverage_adapts_with_confidence_edge_and_score_inside_caps() {
         fn leverage_for(instrument: &str, confidence: f64, take_profit: f64, score: f64) -> f64 {
             let mut config = production_position_manager_config();
-            config.position_size = 1.0;
+            config.max_margin_ratio = 1.0;
             config.min_expected_edge = 0.0;
             config.min_order_delta = 0.0;
             config.min_leverage = 1.0;
@@ -1990,7 +2170,7 @@ mod tests {
     #[test]
     fn asset_and_instrument_managers_create_concrete_orders() {
         let mut config = production_position_manager_config();
-        config.position_size = 0.10;
+        config.max_margin_ratio = 0.10;
         config.min_expected_edge = 0.0;
         config.min_order_delta = 0.0;
         config.max_leverage = 5.0;
@@ -2012,6 +2192,7 @@ mod tests {
                 min_size: 0.002,
                 tick_size: 0.1,
                 max_leverage: 2.0,
+                ..Default::default()
             });
         let orders = manager.handle_signal(Signal {
             venue: "okx".into(),
@@ -2035,7 +2216,7 @@ mod tests {
     #[test]
     fn rejects_below_instrument_min_size() {
         let mut config = production_position_manager_config();
-        config.position_size = 0.01;
+        config.max_margin_ratio = 0.01;
         config.min_expected_edge = 0.0;
         config.min_order_delta = 0.0;
         let mut manager = PositionManager::new(config);
@@ -2054,6 +2235,7 @@ mod tests {
                 min_size: 1.0,
                 tick_size: 0.1,
                 max_leverage: 0.0,
+                ..Default::default()
             });
         let orders = manager.handle_signal(Signal {
             venue: "okx".into(),
@@ -2071,7 +2253,7 @@ mod tests {
     #[test]
     fn phases_reductions_before_openings() {
         let mut config = production_position_manager_config();
-        config.position_size = 0.20;
+        config.max_margin_ratio = 0.20;
         config.min_expected_edge = 0.0;
         config.min_order_delta = 0.0;
         let mut manager = PositionManager::new(config);
@@ -2101,7 +2283,7 @@ mod tests {
         manager.add_position(Position {
             venue: "okx".into(),
             instrument: "BTC-USDT-SWAP".into(),
-            size: 0.15,
+            size: 2.0,
             confidence: 1.0,
             entry_price: 100.0,
             last_price: 100.0,
@@ -2120,7 +2302,7 @@ mod tests {
         assert_eq!(reductions.len(), 1);
         assert_eq!(reductions[0].instrument, "BTC-USDT-SWAP");
         assert_eq!(reductions[0].side, Side::Sell);
-        let expected_btc_target = 0.10 / (1.0 + reductions[0].leverage * reductions[0].fee_rate);
+        let expected_btc_target = (100.0 / (1.0 + reductions[0].leverage * reductions[0].fee_rate)) / reductions[0].price;
         assert!((reductions[0].target_size - expected_btc_target).abs() < 1e-9);
 
         let openings = manager.handle_signal(Signal {
@@ -2141,7 +2323,7 @@ mod tests {
     #[test]
     fn caps_openings_to_available_exposure() {
         let mut config = production_position_manager_config();
-        config.position_size = 0.20;
+        config.max_margin_ratio = 0.20;
         config.min_expected_edge = 0.0;
         config.min_order_delta = 0.0;
         let mut manager = PositionManager::new(config);
@@ -2171,14 +2353,14 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(orders.len(), 1);
-        assert!(order_budget_cost(&orders[0]) <= 0.05 + 1e-9);
-        assert!(orders[0].size_delta < 0.05);
+        assert!(order_budget_cost(&orders[0]) <= 50.0 + 1e-9);
+        assert!(orders[0].margin < 50.0);
     }
 
     #[test]
     fn caps_openings_to_remaining_portfolio_budget_without_asset_snapshots() {
         let mut config = production_position_manager_config();
-        config.position_size = 1.0;
+        config.max_margin_ratio = 1.0;
         config.min_expected_edge = 0.0;
         config.min_order_delta = 0.0;
         config.rebalance_interval = Duration::from_secs(6 * 60 * 60);
@@ -2229,7 +2411,7 @@ mod tests {
             .iter()
             .map(|position| position.size.abs())
             .sum::<f64>();
-        assert!(total <= 1.0 + 1e-9, "total={total}");
+        assert!(total <= 0.01 + 1e-9, "total={total}");
     }
 
     #[test]
@@ -2252,6 +2434,7 @@ mod tests {
                 min_size: 0.01,
                 tick_size: 0.01,
                 max_leverage: 0.0,
+                ..Default::default()
             });
         manager.add_position(Position {
             venue: "okx".into(),

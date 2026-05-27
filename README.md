@@ -4,7 +4,7 @@ Async Rust client crate for Grexie Signals websocket subscriptions and productio
 
 ```toml
 [dependencies]
-grexie-signals-client = "0.1.7"
+grexie-signals-client = "0.1.9"
 ```
 
 ## Websocket Client
@@ -39,7 +39,8 @@ use grexie_signals_client::{
 };
 
 let mut config = production_position_manager_config();
-config.position_size = 0.10;
+config.max_margin_ratio = 0.10;
+config.min_position_size_ratio = 0.01;
 config.max_leverage = 3.0;
 
 let mut manager = PositionManager::new(config);
@@ -61,7 +62,7 @@ let orders = manager.handle_signal(Signal {
 });
 ```
 
-The manager mirrors the server sizing behavior: `position_size` is the total portfolio budget, positions are weighted by confidence, reductions/closes/first-phase flips are emitted before openings or increases, openings are capped by live asset available exposure when asset snapshots are attached, `min_order_delta` scales by `position_size`, same-side churn can be suppressed by `rebalance_interval`, flips are allowed, fees affect realized PnL, and leverage is selected inside configured min/max bounds from confidence, fee-adjusted edge, and score.
+The manager mirrors the server sizing behavior: `max_margin_ratio` is the fraction of `AssetManager` capital that can be allocated as portfolio margin, `min_position_size_ratio` defaults to 1% of capital, positions are signed executable quantities/lots, and emitted orders include quantity, margin, notional, and fee estimates. Positions are weighted by confidence, reductions/closes/first-phase flips are emitted before openings or increases, openings are capped by live asset available exposure when asset snapshots are attached, `min_order_delta` scales by the max margin budget, same-side churn can be suppressed by `rebalance_interval`, flips are allowed, fees affect realized PnL, and leverage is selected inside configured min/max bounds from confidence, fee-adjusted edge, and score.
 
 `PositionManager` ignores replay signal events and ignores live signals whose venue/instrument pair has not been configured in its `InstrumentManager`.
 
