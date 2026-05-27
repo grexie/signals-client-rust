@@ -956,21 +956,25 @@ impl PositionManager {
                 continue;
             };
             let weight = *weights.get(&key).unwrap_or(&0.0);
-            let target_size = *targets.get(&key).unwrap_or(&0.0);
+            let mut target_size = *targets.get(&key).unwrap_or(&0.0);
+            if position.size.abs() > 1e-9 && !self.meets_minimum_position_size(self.position_margin(&key, &position)) {
+                target_size = 0.0;
+            } else if target_size != 0.0
+                && !self.meets_minimum_position_size(self.margin_for_quantity(&key, &position, target_size))
+            {
+                if position.size.abs() <= 1e-9 {
+                    if let Some(current) = self.positions.get_mut(&key) {
+                        current.confidence = weight;
+                    }
+                    continue;
+                }
+                target_size = 0.0;
+            }
             let mut delta = target_size - position.size;
             if is_flip_target(position.size, target_size) {
                 delta = -position.size;
             }
             if delta.abs() <= 1e-9 {
-                if let Some(current) = self.positions.get_mut(&key) {
-                    current.confidence = weight;
-                }
-                continue;
-            }
-            if target_size != 0.0
-                && !self.meets_minimum_position_size(self.margin_for_quantity(&key, &position, target_size))
-                && !is_exposure_reduction(position.size, target_size)
-            {
                 if let Some(current) = self.positions.get_mut(&key) {
                     current.confidence = weight;
                 }
@@ -2412,6 +2416,56 @@ mod tests {
             .map(|position| position.size.abs())
             .sum::<f64>();
         assert!(total <= 0.01 + 1e-9, "total={total}");
+    }
+
+    #[test]
+    fn closes_position_below_minimum_position_size_ratio() {
+        let mut config = production_position_manager_config();
+        config.max_margin_ratio = 1.0;
+        config.min_position_size_ratio = 0.01;
+        config.min_expected_edge = 0.0;
+        config.min_order_delta = 0.0;
+        config.rebalance_interval = Duration::ZERO;
+        let mut manager = PositionManager::new(config);
+        manager.asset_manager_mut().update_asset(AssetSnapshot {
+            currency: "USDT".into(),
+            cash: 1000.0,
+            available: 0.5,
+            used: 999.5,
+            equity: 1000.0,
+        });
+        manager
+            .instrument_manager_mut()
+            .update_instrument(InstrumentMetadata {
+                venue: "okx".into(),
+                instrument: "DUST-USDT-SWAP".into(),
+                settlement_currency: "USDT".into(),
+                ..Default::default()
+            });
+        manager.add_position(Position {
+            venue: "okx".into(),
+            instrument: "DUST-USDT-SWAP".into(),
+            size: 0.005,
+            confidence: 0.5,
+            entry_price: 100.0,
+            last_price: 100.0,
+            ..Default::default()
+        });
+
+        let orders = manager.handle_signal(Signal {
+            venue: "okx".into(),
+            instrument: "DUST-USDT-SWAP".into(),
+            side: Side::Buy,
+            confidence: 1.0,
+            take_profit: 0.02,
+            stop_loss: 0.004,
+            price: 100.0,
+            ..Default::default()
+        });
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].side, Side::Sell);
+        assert_eq!(orders[0].reason, "closing");
+        assert!(orders[0].target_size.abs() <= 1e-9);
     }
 
     #[test]
