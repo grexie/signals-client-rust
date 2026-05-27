@@ -1181,13 +1181,14 @@ impl PositionManager {
     }
 
     fn available_exposure_budget(&self, currency: &str) -> f64 {
+        let portfolio_budget = self.available_portfolio_budget();
         let Some(asset) = self.assets.asset(currency) else {
-            return f64::INFINITY;
+            return portfolio_budget;
         };
         let equity = positive_or(asset.equity, asset.cash + asset.used, asset.cash);
         if equity <= 0.0 {
             return if asset.available > 0.0 {
-                f64::INFINITY
+                portfolio_budget
             } else {
                 0.0
             };
@@ -1195,7 +1196,19 @@ impl PositionManager {
         if asset.available <= 0.0 {
             return 0.0;
         }
-        (asset.available / equity).max(0.0)
+        (asset.available / equity).max(0.0).min(portfolio_budget)
+    }
+
+    fn available_portfolio_budget(&self) -> f64 {
+        if self.config.position_size <= 0.0 {
+            return 0.0;
+        }
+        let used = self
+            .positions
+            .values()
+            .map(|position| position.size.abs())
+            .sum::<f64>();
+        (self.config.position_size - used).max(0.0)
     }
 
     fn executable_allocation_for_budget(
@@ -2160,6 +2173,63 @@ mod tests {
         assert_eq!(orders.len(), 1);
         assert!(order_budget_cost(&orders[0]) <= 0.05 + 1e-9);
         assert!(orders[0].size_delta < 0.05);
+    }
+
+    #[test]
+    fn caps_openings_to_remaining_portfolio_budget_without_asset_snapshots() {
+        let mut config = production_position_manager_config();
+        config.position_size = 1.0;
+        config.min_expected_edge = 0.0;
+        config.min_order_delta = 0.0;
+        config.rebalance_interval = Duration::from_secs(6 * 60 * 60);
+        config.min_leverage = 1.0;
+        config.max_leverage = 1.0;
+        let mut manager = PositionManager::new(config);
+        manager
+            .instrument_manager_mut()
+            .update_instrument(InstrumentMetadata {
+                venue: "okx".into(),
+                instrument: "BTC-USDT-SWAP".into(),
+                settlement_currency: "USDT".into(),
+                ..Default::default()
+            });
+        manager
+            .instrument_manager_mut()
+            .update_instrument(InstrumentMetadata {
+                venue: "okx".into(),
+                instrument: "ETH-USDT-SWAP".into(),
+                settlement_currency: "USDT".into(),
+                ..Default::default()
+            });
+        let orders = manager.handle_signal(Signal {
+            venue: "okx".into(),
+            instrument: "BTC-USDT-SWAP".into(),
+            side: Side::Buy,
+            confidence: 0.51,
+            take_profit: 0.02,
+            stop_loss: 0.004,
+            price: 100.0,
+            timestamp: Some("2026-05-27T00:00:00Z".into()),
+            ..Default::default()
+        });
+        assert_eq!(orders.len(), 1);
+        manager.handle_signal(Signal {
+            venue: "okx".into(),
+            instrument: "ETH-USDT-SWAP".into(),
+            side: Side::Buy,
+            confidence: 0.51,
+            take_profit: 0.02,
+            stop_loss: 0.004,
+            price: 100.0,
+            timestamp: Some("2026-05-27T00:01:00Z".into()),
+            ..Default::default()
+        });
+        let total = manager
+            .positions()
+            .iter()
+            .map(|position| position.size.abs())
+            .sum::<f64>();
+        assert!(total <= 1.0 + 1e-9, "total={total}");
     }
 
     #[test]
