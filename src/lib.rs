@@ -1642,10 +1642,11 @@ impl PositionManager {
         );
         let requested_abs_delta = delta.abs();
         let contract_notional = instrument_contract_notional(price, &metadata);
-        let quantity = if contract_notional > 0.0 {
+        let closes_to_zero = position.size.abs() > 1e-9 && (position.size + delta).abs() <= 1e-9;
+        let quantity = if contract_notional > 0.0 && !closes_to_zero {
             round_down_to_step(requested_abs_delta, metadata.lot_size)
         } else {
-            0.0
+            requested_abs_delta
         };
         let notional = quantity * contract_notional;
         let margin = if leverage > 0.0 {
@@ -2554,6 +2555,8 @@ mod tests {
                 venue: "okx".into(),
                 instrument: "DUST-USDT-SWAP".into(),
                 settlement_currency: "USDT".into(),
+                lot_size: 0.1,
+                min_size: 0.1,
                 ..Default::default()
             });
         manager.add_position(Position {
@@ -2581,6 +2584,8 @@ mod tests {
         assert_eq!(orders[0].side, Side::Sell);
         assert_eq!(orders[0].reason, "closing");
         assert!(orders[0].target_size.abs() <= 1e-9);
+        assert!((orders[0].size_delta + 0.005).abs() <= 1e-9);
+        assert!((orders[0].quantity - 0.005).abs() <= 1e-9);
     }
 
     #[test]
