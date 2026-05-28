@@ -70,6 +70,12 @@ pub struct Signal {
     #[serde(default)]
     pub stop_loss: f64,
     #[serde(default)]
+    pub trailing_stop_activation: f64,
+    #[serde(default)]
+    pub trailing_stop_distance: f64,
+    #[serde(default)]
+    pub trailing_stop_min_profit: f64,
+    #[serde(default)]
     pub score: f64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub components: Vec<SignalComponent>,
@@ -350,6 +356,9 @@ pub struct InstrumentConfig {
     pub taker_fee_rate: Option<f64>,
     pub min_leverage: Option<f64>,
     pub max_leverage: Option<f64>,
+    pub trailing_stop_activation: Option<f64>,
+    pub trailing_stop_distance: Option<f64>,
+    pub trailing_stop_min_profit: Option<f64>,
 }
 
 /// Account state for one settlement currency.
@@ -498,7 +507,12 @@ pub struct Position {
     pub last_price: f64,
     pub take_profit: f64,
     pub stop_loss: f64,
+    pub trailing_stop_activation: f64,
+    pub trailing_stop_distance: f64,
+    pub trailing_stop_min_profit: f64,
     pub leverage: f64,
+    pub mfe: f64,
+    pub mae: f64,
     pub realized_gross: f64,
     pub fees: f64,
     pub realized_pnl: f64,
@@ -531,6 +545,75 @@ impl Position {
             (self.last_price - self.entry_price) / self.entry_price
         }
     }
+
+    fn take_profit_price(&self) -> f64 {
+        if self.entry_price <= 0.0 || self.take_profit <= 0.0 {
+            return 0.0;
+        }
+        if self.size < 0.0 {
+            self.entry_price * (1.0 - self.take_profit)
+        } else {
+            self.entry_price * (1.0 + self.take_profit)
+        }
+    }
+
+    fn stop_loss_price(&self) -> f64 {
+        if self.entry_price <= 0.0 || self.stop_loss <= 0.0 {
+            return 0.0;
+        }
+        if self.size < 0.0 {
+            self.entry_price * (1.0 + self.stop_loss)
+        } else {
+            self.entry_price * (1.0 - self.stop_loss)
+        }
+    }
+
+    fn take_profit_triggered(&self, price: f64) -> bool {
+        let target = self.take_profit_price();
+        if target <= 0.0 {
+            return false;
+        }
+        if self.size < 0.0 {
+            price <= target
+        } else {
+            price >= target
+        }
+    }
+
+    fn stop_loss_triggered(&self, price: f64) -> bool {
+        let target = self.stop_loss_price();
+        if target <= 0.0 {
+            return false;
+        }
+        if self.size < 0.0 {
+            price >= target
+        } else {
+            price <= target
+        }
+    }
+
+    fn trailing_stop_triggered(&self) -> bool {
+        if self.trailing_stop_activation <= 0.0 || self.trailing_stop_distance <= 0.0 {
+            return false;
+        }
+        if self.mfe + 1e-9 < self.trailing_stop_activation {
+            return false;
+        }
+        let floor = (self.mfe - self.trailing_stop_distance).max(self.trailing_stop_min_profit);
+        self.price_move() <= floor + 1e-9
+    }
+
+    fn reset_excursion(&mut self) {
+        let price_move = self.price_move();
+        self.mfe = price_move.max(0.0);
+        self.mae = price_move.min(0.0);
+    }
+
+    fn update_excursion(&mut self) {
+        let price_move = self.price_move();
+        self.mfe = self.mfe.max(price_move);
+        self.mae = self.mae.min(price_move);
+    }
 }
 
 /// Target order recommendation emitted by `PositionManager`.
@@ -560,6 +643,9 @@ pub struct Order {
     pub leverage: f64,
     pub take_profit: f64,
     pub stop_loss: f64,
+    pub trailing_stop_activation: f64,
+    pub trailing_stop_distance: f64,
+    pub trailing_stop_min_profit: f64,
     pub reduce_only: bool,
 }
 
@@ -572,9 +658,13 @@ pub struct ClosedTrade {
     pub size: f64,
     pub entry_price: f64,
     pub exit_price: f64,
+    pub exit_move: f64,
     pub realized_gross: f64,
     pub fees: f64,
     pub realized_pnl: f64,
+    pub mfe: f64,
+    pub mae: f64,
+    pub exit_reason: String,
 }
 
 /// Current runtime PnL stats.
@@ -716,7 +806,50 @@ impl PositionManager {
             order.size_delta,
             positive_or(position.last_price, position.entry_price, 0.0),
             self.taker_fee_rate(&key),
+            "closing",
         );
+        vec![order]
+    }
+
+    pub fn update_price(&mut self, venue: &str, instrument: &str, price: f64) -> Vec<Order> {
+        if price <= 0.0 {
+            return Vec::new();
+        }
+        let key = position_key(venue, instrument);
+        let Some(position) = self.positions.get_mut(&key) else {
+            return Vec::new();
+        };
+        if position.size.abs() <= 1e-9 {
+            return Vec::new();
+        }
+        position.last_price = price;
+        position.update_excursion();
+        let reason = exit_reason(position, price);
+        if reason.is_empty() {
+            return Vec::new();
+        }
+        let fee_rate = if reason == "take_profit" {
+            self.maker_fee_rate(&key)
+        } else {
+            self.taker_fee_rate(&key)
+        };
+        let position = self.positions.get(&key).cloned().unwrap_or_default();
+        let mut order = self.order_for_delta(
+            &key,
+            &position,
+            -position.size,
+            0.0,
+            0.0,
+            reason,
+            position.confidence,
+        );
+        order.fee_rate = fee_rate;
+        order.estimated_fee = fee_value_for_notional(order.notional, fee_rate);
+        order.estimated_fee_value = order.notional * fee_rate;
+        if !self.order_meets_instrument_minimum(&order) {
+            return Vec::new();
+        }
+        self.apply_delta(&key, order.size_delta, price, fee_rate, reason);
         vec![order]
     }
 
@@ -855,6 +988,8 @@ impl PositionManager {
         if self.config.min_expected_edge > 0.0 && edge < self.config.min_expected_edge {
             return Vec::new();
         }
+        let (trailing_stop_activation, trailing_stop_distance, trailing_stop_min_profit) =
+            self.trailing_config_for_signal(&key, &signal);
         let portfolio_budget = self.max_portfolio_margin_budget();
         let min_order_delta = self.effective_min_order_delta();
         let now = SystemTime::now();
@@ -923,6 +1058,11 @@ impl PositionManager {
             position.take_profit = blend_risk(position.take_profit, signal.take_profit, 0.5);
             position.stop_loss = blend_risk(position.stop_loss, signal.stop_loss, 0.5);
         }
+        if trailing_stop_activation > 0.0 && trailing_stop_distance > 0.0 {
+            position.trailing_stop_activation = trailing_stop_activation;
+            position.trailing_stop_distance = trailing_stop_distance;
+            position.trailing_stop_min_profit = trailing_stop_min_profit;
+        }
         position.leverage = leverage;
         self.rebalance(
             HashMap::from([(key.clone(), target_sign)]),
@@ -934,6 +1074,9 @@ impl PositionManager {
                     expected_edge: edge,
                     take_profit: signal.take_profit,
                     stop_loss: signal.stop_loss,
+                    trailing_stop_activation,
+                    trailing_stop_distance,
+                    trailing_stop_min_profit,
                 },
             )]),
         )
@@ -1241,6 +1384,9 @@ impl PositionManager {
             );
             order.take_profit = candidate.context.take_profit;
             order.stop_loss = candidate.context.stop_loss;
+            order.trailing_stop_activation = candidate.context.trailing_stop_activation;
+            order.trailing_stop_distance = candidate.context.trailing_stop_distance;
+            order.trailing_stop_min_profit = candidate.context.trailing_stop_min_profit;
             if !self.order_meets_instrument_minimum(&order) {
                 if let Some(current) = self.positions.get_mut(&candidate.key) {
                     current.confidence = candidate.weight;
@@ -1263,9 +1409,17 @@ impl PositionManager {
                     0.0,
                 ),
                 self.taker_fee_rate(&candidate.key),
+                &candidate.reason,
             );
             if let Some(current) = self.positions.get_mut(&candidate.key) {
                 current.confidence = candidate.weight;
+                if candidate.context.trailing_stop_activation > 0.0
+                    && candidate.context.trailing_stop_distance > 0.0
+                {
+                    current.trailing_stop_activation = candidate.context.trailing_stop_activation;
+                    current.trailing_stop_distance = candidate.context.trailing_stop_distance;
+                    current.trailing_stop_min_profit = candidate.context.trailing_stop_min_profit;
+                }
             }
         }
         orders
@@ -1681,11 +1835,14 @@ impl PositionManager {
             leverage,
             take_profit: 0.0,
             stop_loss: 0.0,
+            trailing_stop_activation: position.trailing_stop_activation,
+            trailing_stop_distance: position.trailing_stop_distance,
+            trailing_stop_min_profit: position.trailing_stop_min_profit,
             reduce_only,
         }
     }
 
-    fn apply_delta(&mut self, key: &str, delta: f64, price: f64, fee_rate: f64) {
+    fn apply_delta(&mut self, key: &str, delta: f64, price: f64, fee_rate: f64, reason: &str) {
         let Some(mut position) = self.positions.remove(key) else {
             return;
         };
@@ -1705,12 +1862,14 @@ impl PositionManager {
             position.fees += fee;
             position.realized_pnl -= fee;
             position.size += delta;
+            position.reset_excursion();
             self.positions.insert(key.to_string(), position);
             return;
         }
         if price > 0.0 {
             position.last_price = price;
         }
+        position.update_excursion();
         let closing = position.size.abs().min(delta.abs());
         let gross = self.realized_gross_for_quantity(key, &position, closing, price);
         let fee = self.fee_for_quantity(key, &position, closing, price, fee_rate);
@@ -1724,9 +1883,13 @@ impl PositionManager {
             size: closing,
             entry_price: position.entry_price,
             exit_price: price,
+            exit_move: position.price_move(),
             realized_gross: position.realized_gross,
             fees: position.fees,
             realized_pnl: position.realized_pnl,
+            mfe: position.mfe,
+            mae: position.mae,
+            exit_reason: reason.to_string(),
         };
         let remaining = delta.abs() - closing;
         if remaining <= 1e-9 {
@@ -1746,6 +1909,7 @@ impl PositionManager {
         position.realized_gross = 0.0;
         position.fees = self.fee_for_quantity(key, &position, remaining, price, fee_rate);
         position.realized_pnl = -position.fees;
+        position.reset_excursion();
         self.positions.insert(key.to_string(), position);
     }
 
@@ -1776,6 +1940,14 @@ impl PositionManager {
         let quality =
             clamp01(clamp01(confidence) * 0.65 + edge_score * 0.25 + score.abs().min(1.0) * 0.10);
         min_leverage + (max_leverage - min_leverage) * quality
+    }
+
+    fn maker_fee_rate(&self, key: &str) -> f64 {
+        self.config
+            .instruments
+            .get(key)
+            .and_then(|c| c.maker_fee_rate)
+            .unwrap_or(self.config.maker_fee_rate)
     }
 
     fn taker_fee_rate(&self, key: &str) -> f64 {
@@ -1810,6 +1982,28 @@ impl PositionManager {
         }
     }
 
+    fn trailing_config_for_signal(&self, key: &str, signal: &Signal) -> (f64, f64, f64) {
+        let mut activation = signal.trailing_stop_activation;
+        let mut distance = signal.trailing_stop_distance;
+        let mut min_profit = signal.trailing_stop_min_profit;
+        if activation <= 0.0 || distance <= 0.0 {
+            if let Some(override_config) = self.config.instruments.get(key) {
+                activation = override_config.trailing_stop_activation.unwrap_or(0.0);
+                distance = override_config.trailing_stop_distance.unwrap_or(0.0);
+                min_profit = override_config.trailing_stop_min_profit.unwrap_or(0.0);
+            }
+        }
+        if activation <= 0.0 || distance <= 0.0 {
+            return (0.0, 0.0, 0.0);
+        }
+        let fee_floor = 2.0 * self.taker_fee_rate(key);
+        min_profit = min_profit.max(fee_floor);
+        if activation < min_profit + 1e-9 {
+            activation = min_profit + distance.min(fee_floor);
+        }
+        (activation.max(0.0), distance.max(0.0), min_profit.max(0.0))
+    }
+
     fn order_meets_instrument_minimum(&self, order: &Order) -> bool {
         if order.quantity <= 0.0 {
             return false;
@@ -1831,6 +2025,9 @@ struct SignalContext {
     expected_edge: f64,
     take_profit: f64,
     stop_loss: f64,
+    trailing_stop_activation: f64,
+    trailing_stop_distance: f64,
+    trailing_stop_min_profit: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -1869,6 +2066,20 @@ fn normalize_config(mut config: PositionManagerConfig) -> PositionManagerConfig 
     config.max_leverage = config.max_leverage.max(0.0);
     config.available_margin_buffer = config.available_margin_buffer.clamp(0.0, 0.95);
     config.executable_margin_buffer = config.executable_margin_buffer.clamp(0.0, 0.05);
+    for instrument in config.instruments.values_mut() {
+        *instrument = normalize_instrument_config(*instrument);
+    }
+    config
+}
+
+fn normalize_instrument_config(mut config: InstrumentConfig) -> InstrumentConfig {
+    config.maker_fee_rate = config.maker_fee_rate.map(|value| value.max(0.0));
+    config.taker_fee_rate = config.taker_fee_rate.map(|value| value.max(0.0));
+    config.min_leverage = config.min_leverage.map(|value| value.max(0.0));
+    config.max_leverage = config.max_leverage.map(|value| value.max(0.0));
+    config.trailing_stop_activation = config.trailing_stop_activation.map(|value| value.max(0.0));
+    config.trailing_stop_distance = config.trailing_stop_distance.map(|value| value.max(0.0));
+    config.trailing_stop_min_profit = config.trailing_stop_min_profit.map(|value| value.max(0.0));
     config
 }
 
@@ -1908,6 +2119,22 @@ fn expected_edge(signal: &Signal) -> f64 {
 
 fn fee_adjusted_expected_edge(signal: &Signal, taker_fee_rate: f64) -> f64 {
     expected_edge(signal) - 2.0 * taker_fee_rate
+}
+
+fn exit_reason(position: &Position, price: f64) -> &'static str {
+    if price <= 0.0 {
+        return "";
+    }
+    if position.take_profit_triggered(price) {
+        return "take_profit";
+    }
+    if position.stop_loss_triggered(price) {
+        return "stop_loss";
+    }
+    if position.trailing_stop_triggered() {
+        return "trailing_stop";
+    }
+    ""
 }
 
 fn order_budget_cost(order: &Order) -> f64 {
@@ -2025,7 +2252,7 @@ mod tests {
 
     #[test]
     fn parses_signal_replay_event() {
-        let event = parse_event(r#"{"type":"signal","subscriptionId":4,"venue":"okx","instrument":"BTC-USDT-SWAP","timestamp":"2026-05-26T00:00:00Z","replay":true,"signal":{"confidence":0.8,"side":"buy","takeProfit":0.01,"stopLoss":0.004}}"#).unwrap();
+        let event = parse_event(r#"{"type":"signal","subscriptionId":4,"venue":"okx","instrument":"BTC-USDT-SWAP","timestamp":"2026-05-26T00:00:00Z","replay":true,"signal":{"confidence":0.8,"side":"buy","takeProfit":0.01,"stopLoss":0.004,"trailingStopActivation":0.02,"trailingStopDistance":0.01,"trailingStopMinProfit":0.001}}"#).unwrap();
         match event {
             SignalsEvent::Signal {
                 subscription_id,
@@ -2037,6 +2264,9 @@ mod tests {
                 assert_eq!(signal.venue, "okx");
                 assert_eq!(signal.instrument, "BTC-USDT-SWAP");
                 assert_eq!(signal.side, Side::Buy);
+                assert!((signal.trailing_stop_activation - 0.02).abs() < 1e-9);
+                assert!((signal.trailing_stop_distance - 0.01).abs() < 1e-9);
+                assert!((signal.trailing_stop_min_profit - 0.001).abs() < 1e-9);
                 assert!(replay);
             }
             other => panic!("unexpected event: {other:?}"),
@@ -2473,6 +2703,78 @@ mod tests {
         assert_eq!(orders.len(), 1);
         assert!(order_budget_cost(&orders[0]) <= 50.0 + 1e-9);
         assert!(orders[0].margin < 50.0);
+    }
+
+    #[test]
+    fn trailing_stop_closes_after_favorable_giveback() {
+        let mut config = production_position_manager_config();
+        config.max_margin_ratio = 1.0;
+        config.min_expected_edge = 0.0;
+        config.min_order_delta = 0.0;
+        let mut manager = PositionManager::new(config);
+        configure_instrument(&mut manager, "okx", "BTC-USDT-SWAP");
+
+        let orders = manager.handle_signal(Signal {
+            venue: "okx".into(),
+            instrument: "BTC-USDT-SWAP".into(),
+            side: Side::Buy,
+            confidence: 1.0,
+            take_profit: 0.50,
+            stop_loss: 0.20,
+            trailing_stop_activation: 0.02,
+            trailing_stop_distance: 0.01,
+            trailing_stop_min_profit: 0.001,
+            price: 100.0,
+            ..Default::default()
+        });
+        assert_eq!(orders.len(), 1);
+        assert!((orders[0].trailing_stop_activation - 0.02).abs() < 1e-9);
+        assert!(manager
+            .update_price("okx", "BTC-USDT-SWAP", 103.0)
+            .is_empty());
+
+        let close = manager.update_price("okx", "BTC-USDT-SWAP", 101.8);
+        assert_eq!(close.len(), 1);
+        assert_eq!(close[0].reason, "trailing_stop");
+        assert!(manager.positions().is_empty());
+        let closed = manager.closed_trades();
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].exit_reason, "trailing_stop");
+        assert!(closed[0].mfe >= 0.03 - 1e-9);
+        assert!(closed[0].realized_pnl > 0.0);
+    }
+
+    #[test]
+    fn trailing_activation_is_at_least_breakeven() {
+        let mut config = production_position_manager_config();
+        config.max_margin_ratio = 1.0;
+        config.min_expected_edge = 0.0;
+        config.min_order_delta = 0.0;
+        config.taker_fee_rate = 0.0005;
+        config.instruments.insert(
+            "okx:BTC-USDT-SWAP".into(),
+            InstrumentConfig {
+                trailing_stop_activation: Some(0.0001),
+                trailing_stop_distance: Some(0.01),
+                ..Default::default()
+            },
+        );
+        let mut manager = PositionManager::new(config);
+        configure_instrument(&mut manager, "okx", "BTC-USDT-SWAP");
+        let orders = manager.handle_signal(Signal {
+            venue: "okx".into(),
+            instrument: "BTC-USDT-SWAP".into(),
+            side: Side::Buy,
+            confidence: 1.0,
+            take_profit: 0.50,
+            stop_loss: 0.20,
+            price: 100.0,
+            ..Default::default()
+        });
+
+        assert_eq!(orders.len(), 1);
+        assert!((orders[0].trailing_stop_min_profit - 0.001).abs() < 1e-9);
+        assert!((orders[0].trailing_stop_activation - 0.002).abs() < 1e-9);
     }
 
     #[test]
