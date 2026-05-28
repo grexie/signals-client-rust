@@ -120,6 +120,8 @@ pub struct Signal {
     pub artifact_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rejected_reason: Option<String>,
+    #[serde(default)]
+    pub manage_positions_only: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<String>,
     #[serde(default)]
@@ -1049,7 +1051,10 @@ impl PositionManager {
             return Vec::new();
         }
         let edge = fee_adjusted_expected_edge(&signal, self.taker_fee_rate(&key));
-        if self.config.min_expected_edge > 0.0 && edge < self.config.min_expected_edge {
+        if self.config.min_expected_edge > 0.0
+            && edge < self.config.min_expected_edge
+            && !signal.manage_positions_only
+        {
             return Vec::new();
         }
         let (trailing_stop_activation, trailing_stop_distance, trailing_stop_min_profit) =
@@ -1057,12 +1062,14 @@ impl PositionManager {
         let portfolio_budget = self.max_portfolio_margin_budget();
         let min_order_delta = self.effective_min_order_delta();
         let now = SystemTime::now();
-        let leverage = self.select_leverage(&key, target_confidence, edge, signal.score);
         let empty_position = self
             .positions
             .get(&key)
             .map(|position| position.size.abs() <= 1e-9)
             .unwrap_or(true);
+        if empty_position && signal.manage_positions_only {
+            return Vec::new();
+        }
         if empty_position
             && (portfolio_budget < min_order_delta
                 || !self.meets_minimum_position_size(portfolio_budget))
@@ -1082,6 +1089,24 @@ impl PositionManager {
                 },
             );
         }
+        let current_sign = self
+            .positions
+            .get(&key)
+            .map(|position| sign(position.size))
+            .unwrap_or(0.0);
+        if signal.manage_positions_only && current_sign == 0.0 {
+            return Vec::new();
+        }
+        let mut context_confidence = target_confidence;
+        let mut override_side = target_sign;
+        if signal.manage_positions_only {
+            if current_sign != target_sign {
+                override_side = 0.0;
+            } else if let Some(position) = self.positions.get(&key) {
+                context_confidence = context_confidence.min(clamp01(position.confidence));
+            }
+        }
+        let leverage = self.select_leverage(&key, context_confidence, edge, signal.score);
         let below_minimum = self
             .positions
             .get(&key)
@@ -1104,7 +1129,7 @@ impl PositionManager {
                 }
             }
         }
-        position.confidence = target_confidence;
+        position.confidence = context_confidence;
         position.last_signal_at = Some(now);
         if signal.price > 0.0 {
             position.last_price = signal.price;
@@ -1129,11 +1154,11 @@ impl PositionManager {
         }
         position.leverage = leverage;
         let orders = self.rebalance(
-            HashMap::from([(key.clone(), target_sign)]),
+            HashMap::from([(key.clone(), override_side)]),
             HashMap::from([(
                 key,
                 SignalContext {
-                    confidence: target_confidence,
+                    confidence: context_confidence,
                     score: signal.score,
                     expected_edge: edge,
                     take_profit: signal.take_profit,
@@ -1141,6 +1166,7 @@ impl PositionManager {
                     trailing_stop_activation,
                     trailing_stop_distance,
                     trailing_stop_min_profit,
+                    manage_positions_only: signal.manage_positions_only,
                 },
             )]),
         );
@@ -1229,6 +1255,10 @@ impl PositionManager {
                 }
                 target_size = 0.0;
             }
+            let context = contexts.get(&key).copied().unwrap_or_default();
+            if context.manage_positions_only {
+                target_size = manage_positions_only_target_size(position.size, target_size);
+            }
             let mut delta = target_size - position.size;
             if is_flip_target(position.size, target_size) {
                 delta = -position.size;
@@ -1255,7 +1285,6 @@ impl PositionManager {
                 }
                 continue;
             }
-            let context = contexts.get(&key).copied().unwrap_or_default();
             let candidate = RebalanceCandidate {
                 key,
                 position: position.clone(),
@@ -1435,6 +1464,14 @@ impl PositionManager {
         let mut opening_exposure_by_currency = HashMap::<String, f64>::new();
         for candidate in candidates {
             let mut delta = candidate.delta;
+            if candidate.context.manage_positions_only
+                && !is_exposure_reduction(candidate.position.size, candidate.position.size + delta)
+            {
+                if let Some(current) = self.positions.get_mut(&candidate.key) {
+                    current.confidence = candidate.weight;
+                }
+                continue;
+            }
             if cap_openings
                 && !is_exposure_reduction(candidate.position.size, candidate.position.size + delta)
             {
@@ -2121,6 +2158,7 @@ struct SignalContext {
     trailing_stop_activation: f64,
     trailing_stop_distance: f64,
     trailing_stop_min_profit: f64,
+    manage_positions_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2275,6 +2313,22 @@ fn is_flip_target(previous_size: f64, target_size: f64) -> bool {
     previous_size.abs() > 1e-9 && target_size.abs() > 1e-9 && !same_sign(previous_size, target_size)
 }
 
+fn manage_positions_only_target_size(previous_size: f64, target_size: f64) -> f64 {
+    if previous_size.abs() <= 1e-9 {
+        return 0.0;
+    }
+    if target_size.abs() <= 1e-9 {
+        return 0.0;
+    }
+    if !same_sign(previous_size, target_size) {
+        return 0.0;
+    }
+    if target_size.abs() > previous_size.abs() {
+        return previous_size;
+    }
+    target_size
+}
+
 fn is_exposure_reduction(previous_size: f64, target_size: f64) -> bool {
     if previous_size.abs() <= 1e-9 {
         return false;
@@ -2346,7 +2400,7 @@ mod tests {
 
     #[test]
     fn parses_signal_replay_event() {
-        let event = parse_event(r#"{"type":"signal","subscriptionId":4,"venue":"okx","instrument":"BTC-USDT-SWAP","timestamp":"2026-05-26T00:00:00Z","replay":true,"signal":{"confidence":0.8,"side":"buy","takeProfit":0.01,"stopLoss":0.004,"trailingStopActivation":0.02,"trailingStopDistance":0.01,"trailingStopMinProfit":0.001}}"#).unwrap();
+        let event = parse_event(r#"{"type":"signal","subscriptionId":4,"venue":"okx","instrument":"BTC-USDT-SWAP","timestamp":"2026-05-26T00:00:00Z","replay":true,"signal":{"confidence":0.8,"side":"buy","takeProfit":0.01,"stopLoss":0.004,"trailingStopActivation":0.02,"trailingStopDistance":0.01,"trailingStopMinProfit":0.001,"managePositionsOnly":true}}"#).unwrap();
         match event {
             SignalsEvent::Signal {
                 subscription_id,
@@ -2361,6 +2415,7 @@ mod tests {
                 assert!((signal.trailing_stop_activation - 0.02).abs() < 1e-9);
                 assert!((signal.trailing_stop_distance - 0.01).abs() < 1e-9);
                 assert!((signal.trailing_stop_min_profit - 0.001).abs() < 1e-9);
+                assert!(signal.manage_positions_only);
                 assert!(replay);
             }
             other => panic!("unexpected event: {other:?}"),
@@ -2368,10 +2423,10 @@ mod tests {
     }
 
     #[test]
-    fn position_manager_opens_and_flips() {
-        let mut config = production_position_manager_config();
-        config.max_margin_ratio = 0.10;
-        config.min_expected_edge = 0.0;
+	fn position_manager_opens_and_flips() {
+		let mut config = production_position_manager_config();
+		config.max_margin_ratio = 0.10;
+		config.min_expected_edge = 0.0;
         config.min_order_delta = 0.20;
         config.rebalance_interval = Duration::from_secs(3600);
         config.max_leverage = 5.0;
@@ -2393,10 +2448,10 @@ mod tests {
         assert!((order_budget_cost(&buy[0]) - 0.10).abs() < 1e-9);
 
         let sell = manager.handle_signal(Signal {
-            venue: "okx".into(),
-            instrument: "BTC-USDT-SWAP".into(),
-            side: Side::Sell,
-            confidence: 0.9,
+			venue: "okx".into(),
+			instrument: "BTC-USDT-SWAP".into(),
+			side: Side::Sell,
+			confidence: 0.9,
             take_profit: 0.02,
             stop_loss: 0.004,
             score: -0.6,
@@ -2410,10 +2465,10 @@ mod tests {
         assert!((sell[0].size_delta + buy[0].target_size).abs() < 1e-9);
 
         let open_short = manager.handle_signal(Signal {
-            venue: "okx".into(),
-            instrument: "BTC-USDT-SWAP".into(),
-            side: Side::Sell,
-            confidence: 0.9,
+			venue: "okx".into(),
+			instrument: "BTC-USDT-SWAP".into(),
+			side: Side::Sell,
+			confidence: 0.9,
             take_profit: 0.02,
             stop_loss: 0.004,
             score: -0.6,
@@ -2445,6 +2500,86 @@ mod tests {
         });
         assert_eq!(accepted.len(), 1);
         assert!((order_budget_cost(&accepted[0]) - 0.10).abs() < 1e-9);
+    }
+
+    #[test]
+	fn manage_positions_only_does_not_open_or_increase_exposure() {
+		let mut config = production_position_manager_config();
+		config.max_margin_ratio = 0.10;
+		config.min_expected_edge = 0.01;
+        config.min_order_delta = 0.0;
+        config.max_leverage = 5.0;
+        let mut manager = PositionManager::new(config);
+        configure_instrument(&mut manager, "okx", "BTC-USDT-SWAP");
+
+        let blocked_open = manager.handle_signal(Signal {
+            venue: "okx".into(),
+            instrument: "BTC-USDT-SWAP".into(),
+            side: Side::Buy,
+            confidence: 0.9,
+            take_profit: 0.02,
+            stop_loss: 0.004,
+            price: 100.0,
+            manage_positions_only: true,
+            ..Default::default()
+        });
+        assert!(blocked_open.is_empty());
+        assert!(manager.positions().is_empty());
+
+        let opened = manager.handle_signal(Signal {
+            venue: "okx".into(),
+            instrument: "BTC-USDT-SWAP".into(),
+            side: Side::Buy,
+            confidence: 0.7,
+            take_profit: 0.02,
+            stop_loss: 0.004,
+            price: 100.0,
+            ..Default::default()
+        });
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0].reason, "opening");
+
+        let same_side = manager.handle_signal(Signal {
+            venue: "okx".into(),
+            instrument: "BTC-USDT-SWAP".into(),
+            side: Side::Buy,
+            confidence: 1.0,
+            take_profit: 0.02,
+            stop_loss: 0.004,
+            price: 100.0,
+            manage_positions_only: true,
+            ..Default::default()
+        });
+        assert!(same_side.is_empty());
+
+        let closed = manager.handle_signal(Signal {
+			venue: "okx".into(),
+			instrument: "BTC-USDT-SWAP".into(),
+			side: Side::Sell,
+			confidence: 0.51,
+            take_profit: 0.02,
+            stop_loss: 0.004,
+            price: 99.0,
+            manage_positions_only: true,
+            ..Default::default()
+        });
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].reason, "closing");
+        assert!(closed[0].target_size.abs() < 1e-9);
+
+        let blocked_short = manager.handle_signal(Signal {
+            venue: "okx".into(),
+            instrument: "BTC-USDT-SWAP".into(),
+            side: Side::Sell,
+            confidence: 0.9,
+            take_profit: 0.02,
+            stop_loss: 0.004,
+            price: 99.0,
+            manage_positions_only: true,
+            ..Default::default()
+        });
+        assert!(blocked_short.is_empty());
+        assert!(manager.positions().is_empty());
     }
 
     #[test]
