@@ -792,6 +792,17 @@ impl PositionManager {
         &mut self.instruments
     }
 
+    pub fn update_config(&mut self, mut config: PositionManagerConfig) {
+        if config.instruments.is_empty() {
+            config.instruments = self.config.instruments.clone();
+        }
+        if config.persist.is_none() {
+            config.persist = self.config.persist.clone();
+        }
+        config.initial_state = None;
+        self.config = normalize_config(config);
+    }
+
     pub fn add_position(&mut self, position: Position) {
         let mut position = position;
         if position.leverage <= 0.0 {
@@ -2579,6 +2590,54 @@ mod tests {
         assert!(high <= 5.0);
         assert!(scored > low);
         assert!((high - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn update_config_keeps_state_and_changes_leverage() {
+        let mut config = production_position_manager_config();
+        config.max_margin_ratio = 1.0;
+        config.min_expected_edge = 0.0;
+        config.min_order_delta = 0.0;
+        config.rebalance_interval = Duration::from_secs(60 * 60);
+        config.min_leverage = 5.0;
+        config.max_leverage = 5.0;
+        let mut manager = PositionManager::new(config);
+        configure_instrument(&mut manager, "okx", "BTC-USDT-SWAP");
+        let opening = manager.handle_signal(Signal {
+            venue: "okx".into(),
+            instrument: "BTC-USDT-SWAP".into(),
+            side: Side::Buy,
+            confidence: 1.0,
+            take_profit: 0.02,
+            stop_loss: 0.004,
+            score: 1.0,
+            price: 100.0,
+            ..Default::default()
+        });
+        assert!((opening[0].leverage - 5.0).abs() < 1e-9);
+
+        let mut next = production_position_manager_config();
+        next.max_margin_ratio = 1.0;
+        next.min_expected_edge = 0.0;
+        next.min_order_delta = 0.0;
+        next.rebalance_interval = Duration::from_secs(60 * 60);
+        next.min_leverage = 1.0;
+        next.max_leverage = 1.0;
+        manager.update_config(next);
+        assert_eq!(manager.positions().len(), 1);
+        let closing = manager.handle_signal(Signal {
+            venue: "okx".into(),
+            instrument: "BTC-USDT-SWAP".into(),
+            side: Side::Sell,
+            confidence: 1.0,
+            take_profit: 0.02,
+            stop_loss: 0.004,
+            score: -1.0,
+            price: 99.0,
+            ..Default::default()
+        });
+        assert!(closing[0].reduce_only);
+        assert!((closing[0].leverage - 1.0).abs() < 1e-9);
     }
 
     #[test]
