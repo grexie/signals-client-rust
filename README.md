@@ -4,7 +4,7 @@ Async Rust client crate for Grexie Signals websocket subscriptions and productio
 
 ```toml
 [dependencies]
-grexie-signals-client = "0.1.12"
+grexie-signals-client = "0.1.13"
 ```
 
 ## Websocket Client

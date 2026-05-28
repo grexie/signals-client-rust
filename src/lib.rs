@@ -6,6 +6,7 @@
 //! production Grexie Signals server.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use futures_util::stream::{SplitSink, SplitStream};
@@ -454,7 +455,7 @@ impl InstrumentManager {
 }
 
 /// Fee-aware position manager configuration.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PositionManagerConfig {
     pub max_margin_ratio: f64,
     pub position_size: f64,
@@ -469,6 +470,32 @@ pub struct PositionManagerConfig {
     pub available_margin_buffer: f64,
     pub executable_margin_buffer: f64,
     pub instruments: HashMap<String, InstrumentConfig>,
+    pub initial_state: Option<PositionManagerState>,
+    pub persist: Option<PositionManagerPersist>,
+}
+
+pub type PositionManagerPersist = Arc<dyn Fn(PositionManagerState) + Send + Sync>;
+
+impl std::fmt::Debug for PositionManagerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PositionManagerConfig")
+            .field("max_margin_ratio", &self.max_margin_ratio)
+            .field("position_size", &self.position_size)
+            .field("min_expected_edge", &self.min_expected_edge)
+            .field("min_order_delta", &self.min_order_delta)
+            .field("min_position_size_ratio", &self.min_position_size_ratio)
+            .field("rebalance_interval", &self.rebalance_interval)
+            .field("maker_fee_rate", &self.maker_fee_rate)
+            .field("taker_fee_rate", &self.taker_fee_rate)
+            .field("min_leverage", &self.min_leverage)
+            .field("max_leverage", &self.max_leverage)
+            .field("available_margin_buffer", &self.available_margin_buffer)
+            .field("executable_margin_buffer", &self.executable_margin_buffer)
+            .field("instruments", &self.instruments)
+            .field("initial_state", &self.initial_state)
+            .field("persist", &self.persist.as_ref().map(|_| "<callback>"))
+            .finish()
+    }
 }
 
 impl Default for PositionManagerConfig {
@@ -493,6 +520,8 @@ pub fn production_position_manager_config() -> PositionManagerConfig {
         available_margin_buffer: 0.10,
         executable_margin_buffer: 0.001,
         instruments: HashMap::new(),
+        initial_state: None,
+        persist: None,
     }
 }
 
@@ -667,6 +696,13 @@ pub struct ClosedTrade {
     pub exit_reason: String,
 }
 
+/// Durable runtime snapshot for hydrating a position manager after restart.
+#[derive(Debug, Clone, Default)]
+pub struct PositionManagerState {
+    pub positions: Vec<Position>,
+    pub closed_trades: Vec<ClosedTrade>,
+}
+
 /// Current runtime PnL stats.
 #[derive(Debug, Clone, Default)]
 pub struct PositionStats {
@@ -726,13 +762,18 @@ pub struct PositionManager {
 
 impl PositionManager {
     pub fn new(config: PositionManagerConfig) -> Self {
-        Self {
-            config: normalize_config(config),
+        let config = normalize_config(config);
+        let mut manager = Self {
+            config,
             assets: AssetManager::default(),
             instruments: InstrumentManager::default(),
             positions: HashMap::new(),
             closed: Vec::new(),
+        };
+        if let Some(state) = manager.config.initial_state.clone() {
+            manager.hydrate_state(state);
         }
+        manager
     }
 
     pub fn asset_manager(&self) -> &AssetManager {
@@ -761,6 +802,7 @@ impl PositionManager {
             position_key(&position.venue, &position.instrument),
             position,
         );
+        self.persist();
     }
 
     pub fn update_position(&mut self, position: Position) {
@@ -776,8 +818,17 @@ impl PositionManager {
             {
                 continue;
             }
-            self.add_position(position);
+            let mut position = position;
+            if position.leverage <= 0.0 {
+                let key = position_key(&position.venue, &position.instrument);
+                position.leverage = self.min_leverage(&key);
+            }
+            self.positions.insert(
+                position_key(&position.venue, &position.instrument),
+                position,
+            );
         }
+        self.persist();
     }
 
     pub fn close_position(&mut self, venue: &str, instrument: &str) -> Vec<Order> {
@@ -808,6 +859,7 @@ impl PositionManager {
             self.taker_fee_rate(&key),
             "closing",
         );
+        self.persist();
         vec![order]
     }
 
@@ -826,6 +878,7 @@ impl PositionManager {
         position.update_excursion();
         let reason = exit_reason(position, price);
         if reason.is_empty() {
+            self.persist();
             return Vec::new();
         }
         let fee_rate = if reason == "take_profit" {
@@ -847,9 +900,11 @@ impl PositionManager {
         order.estimated_fee = fee_value_for_notional(order.notional, fee_rate);
         order.estimated_fee_value = order.notional * fee_rate;
         if !self.order_meets_instrument_minimum(&order) {
+            self.persist();
             return Vec::new();
         }
         self.apply_delta(&key, order.size_delta, price, fee_rate, reason);
+        self.persist();
         vec![order]
     }
 
@@ -861,6 +916,15 @@ impl PositionManager {
 
     pub fn closed_trades(&self) -> &[ClosedTrade] {
         &self.closed
+    }
+
+    pub fn state(&self) -> PositionManagerState {
+        let mut positions = self.positions.values().cloned().collect::<Vec<_>>();
+        positions.sort_by(|a, b| (&a.venue, &a.instrument).cmp(&(&b.venue, &b.instrument)));
+        PositionManagerState {
+            positions,
+            closed_trades: self.closed.clone(),
+        }
     }
 
     pub fn stats(&self) -> PositionStats {
@@ -1064,7 +1128,7 @@ impl PositionManager {
             position.trailing_stop_min_profit = trailing_stop_min_profit;
         }
         position.leverage = leverage;
-        self.rebalance(
+        let orders = self.rebalance(
             HashMap::from([(key.clone(), target_sign)]),
             HashMap::from([(
                 key,
@@ -1079,7 +1143,36 @@ impl PositionManager {
                     trailing_stop_min_profit,
                 },
             )]),
-        )
+        );
+        self.persist();
+        orders
+    }
+
+    fn hydrate_state(&mut self, state: PositionManagerState) {
+        self.positions.clear();
+        for mut position in state.positions {
+            if position.venue.is_empty()
+                || position.instrument.is_empty()
+                || position.size.abs() <= 1e-9
+            {
+                continue;
+            }
+            if position.leverage <= 0.0 {
+                let key = position_key(&position.venue, &position.instrument);
+                position.leverage = self.min_leverage(&key);
+            }
+            self.positions.insert(
+                position_key(&position.venue, &position.instrument),
+                position,
+            );
+        }
+        self.closed = state.closed_trades;
+    }
+
+    fn persist(&self) {
+        if let Some(persist) = self.config.persist.clone() {
+            persist(self.state());
+        }
     }
 
     fn rebalance(
@@ -2239,6 +2332,7 @@ fn blend_risk(current: f64, incoming: f64, gate: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     fn configure_instrument(manager: &mut PositionManager, venue: &str, instrument: &str) {
         manager
@@ -2742,6 +2836,46 @@ mod tests {
         assert_eq!(closed[0].exit_reason, "trailing_stop");
         assert!(closed[0].mfe >= 0.03 - 1e-9);
         assert!(closed[0].realized_pnl > 0.0);
+    }
+
+    #[test]
+    fn persists_and_hydrates_trailing_stop_state() {
+        let snapshots = Arc::new(Mutex::new(Vec::<PositionManagerState>::new()));
+        let capture = snapshots.clone();
+        let mut config = production_position_manager_config();
+        config.max_margin_ratio = 1.0;
+        config.min_expected_edge = 0.0;
+        config.min_order_delta = 0.0;
+        config.persist = Some(Arc::new(move |state| {
+            capture.lock().unwrap().push(state);
+        }));
+        let mut manager = PositionManager::new(config);
+        configure_instrument(&mut manager, "okx", "BTC-USDT-SWAP");
+        manager.handle_signal(Signal {
+            venue: "okx".into(),
+            instrument: "BTC-USDT-SWAP".into(),
+            side: Side::Buy,
+            confidence: 1.0,
+            take_profit: 0.50,
+            stop_loss: 0.20,
+            trailing_stop_activation: 0.02,
+            trailing_stop_distance: 0.01,
+            trailing_stop_min_profit: 0.001,
+            price: 100.0,
+            ..Default::default()
+        });
+        manager.update_price("okx", "BTC-USDT-SWAP", 104.0);
+
+        let latest = snapshots.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(latest.positions.len(), 1);
+        assert!((latest.positions[0].trailing_stop_activation - 0.02).abs() < 1e-9);
+        assert!(latest.positions[0].mfe > 0.039);
+
+        let mut hydrate_config = production_position_manager_config();
+        hydrate_config.initial_state = Some(latest.clone());
+        let rehydrated = PositionManager::new(hydrate_config);
+        assert_eq!(rehydrated.positions().len(), 1);
+        assert_eq!(rehydrated.positions()[0].mfe, latest.positions[0].mfe);
     }
 
     #[test]
