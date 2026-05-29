@@ -465,6 +465,8 @@ pub struct PositionManagerConfig {
     pub min_order_delta: f64,
     pub min_position_size_ratio: f64,
     pub rebalance_interval: Duration,
+    pub flip_flop_window: Duration,
+    pub signal_flip_min_confidence: f64,
     pub maker_fee_rate: f64,
     pub taker_fee_rate: f64,
     pub min_leverage: f64,
@@ -487,6 +489,11 @@ impl std::fmt::Debug for PositionManagerConfig {
             .field("min_order_delta", &self.min_order_delta)
             .field("min_position_size_ratio", &self.min_position_size_ratio)
             .field("rebalance_interval", &self.rebalance_interval)
+            .field("flip_flop_window", &self.flip_flop_window)
+            .field(
+                "signal_flip_min_confidence",
+                &self.signal_flip_min_confidence,
+            )
             .field("maker_fee_rate", &self.maker_fee_rate)
             .field("taker_fee_rate", &self.taker_fee_rate)
             .field("min_leverage", &self.min_leverage)
@@ -515,6 +522,8 @@ pub fn production_position_manager_config() -> PositionManagerConfig {
         min_order_delta: 0.20,
         min_position_size_ratio: 0.01,
         rebalance_interval: Duration::from_secs(6 * 60 * 60),
+        flip_flop_window: Duration::from_secs(30 * 60),
+        signal_flip_min_confidence: 0.0,
         maker_fee_rate: 0.0002,
         taker_fee_rate: 0.0005,
         min_leverage: 1.0,
@@ -1130,6 +1139,17 @@ impl PositionManager {
             return Vec::new();
         };
         let is_flip = sign(position.size) != 0.0 && sign(position.size) != target_sign;
+        if is_flip
+            && should_suppress_flip_flop(
+                position,
+                &signal,
+                now,
+                self.config.flip_flop_window,
+                self.config.signal_flip_min_confidence,
+            )
+        {
+            return Vec::new();
+        }
         if !is_flip && !below_minimum && position.size.abs() > 1e-9 {
             if let Some(last_signal_at) = position.last_signal_at {
                 if self.config.rebalance_interval > Duration::ZERO
@@ -2202,6 +2222,7 @@ fn normalize_config(mut config: PositionManagerConfig) -> PositionManagerConfig 
     config.min_expected_edge = config.min_expected_edge.max(0.0);
     config.min_order_delta = config.min_order_delta.clamp(0.0, 1.0);
     config.min_position_size_ratio = config.min_position_size_ratio.clamp(0.0, 1.0);
+    config.signal_flip_min_confidence = config.signal_flip_min_confidence.clamp(0.0, 1.0);
     config.maker_fee_rate = config.maker_fee_rate.max(0.0);
     config.taker_fee_rate = config.taker_fee_rate.max(0.0);
     config.min_leverage = config.min_leverage.max(0.0);
@@ -2212,6 +2233,25 @@ fn normalize_config(mut config: PositionManagerConfig) -> PositionManagerConfig 
         *instrument = normalize_instrument_config(*instrument);
     }
     config
+}
+
+fn should_suppress_flip_flop(
+    position: &Position,
+    signal: &Signal,
+    now: SystemTime,
+    flip_flop_window: Duration,
+    signal_flip_min_confidence: f64,
+) -> bool {
+    if signal.manage_positions_only || flip_flop_window == Duration::ZERO {
+        return false;
+    }
+    let Some(last_signal_at) = position.last_signal_at else {
+        return false;
+    };
+    if now.duration_since(last_signal_at).unwrap_or_default() >= flip_flop_window {
+        return false;
+    }
+    signal_flip_min_confidence <= 0.0 || signal.confidence + 1e-12 < signal_flip_min_confidence
 }
 
 fn normalize_instrument_config(mut config: InstrumentConfig) -> InstrumentConfig {
@@ -2434,12 +2474,13 @@ mod tests {
     }
 
     #[test]
-	fn position_manager_opens_and_flips() {
-		let mut config = production_position_manager_config();
-		config.max_margin_ratio = 0.10;
-		config.min_expected_edge = 0.0;
+    fn position_manager_opens_and_flips() {
+        let mut config = production_position_manager_config();
+        config.max_margin_ratio = 0.10;
+        config.min_expected_edge = 0.0;
         config.min_order_delta = 0.20;
         config.rebalance_interval = Duration::from_secs(3600);
+        config.flip_flop_window = Duration::ZERO;
         config.max_leverage = 5.0;
         let mut manager = PositionManager::new(config);
         configure_instrument(&mut manager, "okx", "BTC-USDT-SWAP");
@@ -2459,10 +2500,10 @@ mod tests {
         assert!((order_budget_cost(&buy[0]) - 0.10).abs() < 1e-9);
 
         let sell = manager.handle_signal(Signal {
-			venue: "okx".into(),
-			instrument: "BTC-USDT-SWAP".into(),
-			side: Side::Sell,
-			confidence: 0.9,
+            venue: "okx".into(),
+            instrument: "BTC-USDT-SWAP".into(),
+            side: Side::Sell,
+            confidence: 0.9,
             take_profit: 0.02,
             stop_loss: 0.004,
             score: -0.6,
@@ -2476,10 +2517,10 @@ mod tests {
         assert!((sell[0].size_delta + buy[0].target_size).abs() < 1e-9);
 
         let open_short = manager.handle_signal(Signal {
-			venue: "okx".into(),
-			instrument: "BTC-USDT-SWAP".into(),
-			side: Side::Sell,
-			confidence: 0.9,
+            venue: "okx".into(),
+            instrument: "BTC-USDT-SWAP".into(),
+            side: Side::Sell,
+            confidence: 0.9,
             take_profit: 0.02,
             stop_loss: 0.004,
             score: -0.6,
@@ -2489,6 +2530,101 @@ mod tests {
         assert_eq!(open_short.len(), 1);
         assert_eq!(open_short[0].side, Side::Sell);
         assert_eq!(open_short[0].reason, "opening");
+    }
+
+    #[test]
+    fn position_manager_suppresses_flip_flop_by_default() {
+        let mut config = production_position_manager_config();
+        config.max_margin_ratio = 0.10;
+        config.min_expected_edge = 0.0;
+        config.min_order_delta = 0.0;
+        let mut manager = PositionManager::new(config);
+        configure_instrument(&mut manager, "okx", "BTC-USDT-SWAP");
+        let opened = manager.handle_signal(Signal {
+            venue: "okx".into(),
+            instrument: "BTC-USDT-SWAP".into(),
+            side: Side::Buy,
+            confidence: 0.8,
+            take_profit: 0.02,
+            stop_loss: 0.004,
+            price: 100.0,
+            ..Default::default()
+        });
+        assert_eq!(opened.len(), 1);
+        let strong = manager.handle_signal(Signal {
+            venue: "okx".into(),
+            instrument: "BTC-USDT-SWAP".into(),
+            side: Side::Sell,
+            confidence: 0.99,
+            take_profit: 0.02,
+            stop_loss: 0.004,
+            price: 99.95,
+            ..Default::default()
+        });
+        assert!(strong.is_empty());
+        manager
+            .positions
+            .get_mut("okx:BTC-USDT-SWAP")
+            .unwrap()
+            .last_signal_at = Some(SystemTime::now() - Duration::from_secs(31 * 60));
+        let outside_window = manager.handle_signal(Signal {
+            venue: "okx".into(),
+            instrument: "BTC-USDT-SWAP".into(),
+            side: Side::Sell,
+            confidence: 0.99,
+            take_profit: 0.02,
+            stop_loss: 0.004,
+            price: 99.95,
+            ..Default::default()
+        });
+        assert_eq!(outside_window.len(), 1);
+        assert_eq!(outside_window[0].reason, "flip");
+    }
+
+    #[test]
+    fn position_manager_allows_explicit_high_confidence_flip_threshold() {
+        let mut config = production_position_manager_config();
+        config.max_margin_ratio = 0.10;
+        config.min_expected_edge = 0.0;
+        config.min_order_delta = 0.0;
+        config.flip_flop_window = Duration::from_secs(30 * 60);
+        config.signal_flip_min_confidence = 0.72;
+        let mut manager = PositionManager::new(config);
+        configure_instrument(&mut manager, "okx", "BTC-USDT-SWAP");
+        let opened = manager.handle_signal(Signal {
+            venue: "okx".into(),
+            instrument: "BTC-USDT-SWAP".into(),
+            side: Side::Buy,
+            confidence: 0.8,
+            take_profit: 0.02,
+            stop_loss: 0.004,
+            price: 100.0,
+            ..Default::default()
+        });
+        assert_eq!(opened.len(), 1);
+        let weak = manager.handle_signal(Signal {
+            venue: "okx".into(),
+            instrument: "BTC-USDT-SWAP".into(),
+            side: Side::Sell,
+            confidence: 0.70,
+            take_profit: 0.02,
+            stop_loss: 0.004,
+            price: 99.95,
+            ..Default::default()
+        });
+        assert!(weak.is_empty());
+        let strong = manager.handle_signal(Signal {
+            venue: "okx".into(),
+            instrument: "BTC-USDT-SWAP".into(),
+            side: Side::Sell,
+            confidence: 0.72,
+            take_profit: 0.02,
+            stop_loss: 0.004,
+            price: 99.95,
+            ..Default::default()
+        });
+        assert_eq!(strong.len(), 1);
+        assert_eq!(strong[0].reason, "flip");
     }
 
     #[test]
@@ -2514,10 +2650,10 @@ mod tests {
     }
 
     #[test]
-	fn manage_positions_only_does_not_open_or_increase_exposure() {
-		let mut config = production_position_manager_config();
-		config.max_margin_ratio = 0.10;
-		config.min_expected_edge = 0.01;
+    fn manage_positions_only_does_not_open_or_increase_exposure() {
+        let mut config = production_position_manager_config();
+        config.max_margin_ratio = 0.10;
+        config.min_expected_edge = 0.01;
         config.min_order_delta = 0.0;
         config.max_leverage = 5.0;
         let mut manager = PositionManager::new(config);
@@ -2564,10 +2700,10 @@ mod tests {
         assert!(same_side.is_empty());
 
         let closed = manager.handle_signal(Signal {
-			venue: "okx".into(),
-			instrument: "BTC-USDT-SWAP".into(),
-			side: Side::Sell,
-			confidence: 0.51,
+            venue: "okx".into(),
+            instrument: "BTC-USDT-SWAP".into(),
+            side: Side::Sell,
+            confidence: 0.51,
             take_profit: 0.02,
             stop_loss: 0.004,
             price: 99.0,
@@ -2734,6 +2870,7 @@ mod tests {
         config.min_expected_edge = 0.0;
         config.min_order_delta = 0.0;
         config.rebalance_interval = Duration::from_secs(60 * 60);
+        config.flip_flop_window = Duration::ZERO;
         config.min_leverage = 5.0;
         config.max_leverage = 5.0;
         let mut manager = PositionManager::new(config);
@@ -2756,6 +2893,7 @@ mod tests {
         next.min_expected_edge = 0.0;
         next.min_order_delta = 0.0;
         next.rebalance_interval = Duration::from_secs(60 * 60);
+        next.flip_flop_window = Duration::ZERO;
         next.min_leverage = 1.0;
         next.max_leverage = 1.0;
         manager.update_config(next);
