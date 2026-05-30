@@ -432,6 +432,13 @@ impl InstrumentManager {
         );
     }
 
+    pub fn remove_instrument(&mut self, venue: &str, instrument: &str) {
+        if venue.is_empty() || instrument.is_empty() {
+            return;
+        }
+        self.instruments.remove(&position_key(venue, instrument));
+    }
+
     pub fn instrument(&self, venue: &str, instrument: &str) -> InstrumentMetadata {
         self.instruments
             .get(&position_key(venue, instrument))
@@ -2579,6 +2586,36 @@ mod tests {
         });
         assert_eq!(outside_window.len(), 1);
         assert_eq!(outside_window[0].reason, "flip");
+    }
+
+    #[test]
+    fn position_manager_ignores_signals_after_instrument_removed() {
+        let mut manager = PositionManager::new(production_position_manager_config());
+        manager.assets.update_asset(AssetSnapshot {
+            currency: "USDT".into(),
+            available: 1000.0,
+            equity: 1000.0,
+            ..Default::default()
+        });
+        configure_instrument(&mut manager, "okx", "BTC-USDT-SWAP");
+        manager
+            .instrument_manager_mut()
+            .remove_instrument("okx", "BTC-USDT-SWAP");
+        let orders = manager.handle_signal(Signal {
+            venue: "okx".into(),
+            instrument: "BTC-USDT-SWAP".into(),
+            side: Side::Buy,
+            confidence: 1.0,
+            take_profit: 0.03,
+            stop_loss: 0.01,
+            score: 1.0,
+            price: 100.0,
+            ..Default::default()
+        });
+        assert!(orders.is_empty());
+        assert!(!manager
+            .instrument_manager()
+            .has_instrument("okx", "BTC-USDT-SWAP"));
     }
 
     #[test]
