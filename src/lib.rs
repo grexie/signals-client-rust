@@ -156,6 +156,13 @@ pub enum SignalsEvent {
         replay: bool,
         replayed_at: Option<String>,
     },
+    Backtest {
+        subscription_id: i64,
+        venue: String,
+        instrument: String,
+        backtest: serde_json::Value,
+        timestamp: Option<String>,
+    },
     Signal {
         subscription_id: i64,
         venue: String,
@@ -223,6 +230,7 @@ struct RawEvent {
     timestamp: Option<String>,
     replay: Option<bool>,
     replayed_at: Option<String>,
+    backtest: Option<serde_json::Value>,
     signal: Option<Signal>,
     intent_id: Option<String>,
     action: Option<String>,
@@ -283,6 +291,13 @@ pub fn parse_event(raw: &str) -> Result<SignalsEvent, SignalsClientError> {
             timestamp: msg.timestamp,
             replay: msg.replay.unwrap_or(false),
             replayed_at: msg.replayed_at,
+        }),
+        "backtest" => Ok(SignalsEvent::Backtest {
+            subscription_id: msg.subscription_id.unwrap_or_default(),
+            venue: msg.venue.unwrap_or_default(),
+            instrument: msg.instrument.unwrap_or_default(),
+            backtest: msg.backtest.unwrap_or_else(|| serde_json::json!({})),
+            timestamp: msg.timestamp,
         }),
         "signal" => {
             let mut signal = msg.signal.unwrap_or_default();
@@ -3155,6 +3170,18 @@ mod tests {
                 assert_eq!(stage, "ready");
                 assert!(replay);
                 assert!(replayed_at.is_some());
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        let backtest = parse_event(r#"{"type":"backtest","subscriptionId":3,"venue":"okx","instrument":"BASKET:1","timestamp":"2026-05-31T17:00:00Z","backtest":{"accepted":true,"candidate":{"total":0.12}}}"#).unwrap();
+        match backtest {
+            SignalsEvent::Backtest {
+                subscription_id,
+                backtest,
+                ..
+            } => {
+                assert_eq!(subscription_id, 3);
+                assert_eq!(backtest["accepted"], serde_json::json!(true));
             }
             other => panic!("unexpected event: {other:?}"),
         }
