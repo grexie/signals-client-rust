@@ -165,6 +165,43 @@ pub enum SignalsEvent {
         replay: bool,
         replayed_at: Option<String>,
     },
+    CreateMarketOrder {
+        subscription_id: i64,
+        intent_id: Option<String>,
+        action: Option<String>,
+        venue: Option<String>,
+        instrument: String,
+        side: String,
+        order_type: Option<String>,
+        contract_size: f64,
+        leverage: f64,
+        reduce_only: bool,
+        take_profit_price: f64,
+        stop_loss_price: f64,
+        take_profit: f64,
+        stop_loss: f64,
+        timestamp: Option<String>,
+    },
+    UpdateTPSL {
+        subscription_id: i64,
+        intent_id: Option<String>,
+        venue: Option<String>,
+        instrument: String,
+        side: String,
+        take_profit_price: f64,
+        stop_loss_price: f64,
+        take_profit: f64,
+        stop_loss: f64,
+        timestamp: Option<String>,
+    },
+    Withdraw {
+        subscription_id: i64,
+        intent_id: Option<String>,
+        venue: Option<String>,
+        currency: String,
+        amount: f64,
+        timestamp: Option<String>,
+    },
     Error {
         code: Option<String>,
         message: Option<String>,
@@ -186,6 +223,19 @@ struct RawEvent {
     replay: Option<bool>,
     replayed_at: Option<String>,
     signal: Option<Signal>,
+    intent_id: Option<String>,
+    action: Option<String>,
+    side: Option<String>,
+    order_type: Option<String>,
+    contract_size: Option<f64>,
+    leverage: Option<f64>,
+    reduce_only: Option<bool>,
+    take_profit_price: Option<f64>,
+    stop_loss_price: Option<f64>,
+    take_profit: Option<f64>,
+    stop_loss: Option<f64>,
+    currency: Option<String>,
+    amount: Option<f64>,
 }
 
 /// Errors returned by the websocket client and protocol parser.
@@ -255,6 +305,43 @@ pub fn parse_event(raw: &str) -> Result<SignalsEvent, SignalsClientError> {
                 replayed_at: msg.replayed_at,
             })
         }
+        "create-market-order" => Ok(SignalsEvent::CreateMarketOrder {
+            subscription_id: msg.subscription_id.unwrap_or_default(),
+            intent_id: msg.intent_id,
+            action: msg.action,
+            venue: msg.venue,
+            instrument: msg.instrument.unwrap_or_default(),
+            side: msg.side.unwrap_or_default(),
+            order_type: msg.order_type,
+            contract_size: msg.contract_size.unwrap_or_default(),
+            leverage: msg.leverage.unwrap_or_default(),
+            reduce_only: msg.reduce_only.unwrap_or(false),
+            take_profit_price: msg.take_profit_price.unwrap_or_default(),
+            stop_loss_price: msg.stop_loss_price.unwrap_or_default(),
+            take_profit: msg.take_profit.unwrap_or_default(),
+            stop_loss: msg.stop_loss.unwrap_or_default(),
+            timestamp: msg.timestamp,
+        }),
+        "update-tpsl" => Ok(SignalsEvent::UpdateTPSL {
+            subscription_id: msg.subscription_id.unwrap_or_default(),
+            intent_id: msg.intent_id,
+            venue: msg.venue,
+            instrument: msg.instrument.unwrap_or_default(),
+            side: msg.side.unwrap_or_default(),
+            take_profit_price: msg.take_profit_price.unwrap_or_default(),
+            stop_loss_price: msg.stop_loss_price.unwrap_or_default(),
+            take_profit: msg.take_profit.unwrap_or_default(),
+            stop_loss: msg.stop_loss.unwrap_or_default(),
+            timestamp: msg.timestamp,
+        }),
+        "withdraw" => Ok(SignalsEvent::Withdraw {
+            subscription_id: msg.subscription_id.unwrap_or_default(),
+            intent_id: msg.intent_id,
+            venue: msg.venue,
+            currency: msg.currency.unwrap_or_default(),
+            amount: msg.amount.unwrap_or_default(),
+            timestamp: msg.timestamp,
+        }),
         "error" => Ok(SignalsEvent::Error {
             code: msg.code,
             message: msg.message,
@@ -319,6 +406,96 @@ impl SignalsClient {
         .await
     }
 
+    /// Subscribes to one Bollinger-router basket.
+    pub async fn subscribe_basket(
+        &mut self,
+        venue: &str,
+        instruments: &[String],
+        profit_withdraw_ratio: f64,
+    ) -> Result<(), SignalsClientError> {
+        self.send_json(serde_json::json!({
+            "type": "subscribe",
+            "venue": venue,
+            "instruments": instruments,
+            "profitWithdrawRatio": profit_withdraw_ratio
+        }))
+        .await
+    }
+
+    pub async fn update_asset(
+        &mut self,
+        subscription_id: i64,
+        asset: &AssetSnapshot,
+    ) -> Result<(), SignalsClientError> {
+        self.send_json(serde_json::json!({
+            "type": "update-asset",
+            "subscriptionId": subscription_id,
+            "venue": asset.venue,
+            "currency": asset.currency,
+            "cash": asset.cash,
+            "available": asset.available,
+            "used": asset.used,
+            "equity": asset.equity,
+            "maxUsage": asset.max_usage
+        }))
+        .await
+    }
+
+    pub async fn update_position(
+        &mut self,
+        subscription_id: i64,
+        position: &Position,
+    ) -> Result<(), SignalsClientError> {
+        self.send_json(serde_json::json!({
+            "type": "update-position",
+            "subscriptionId": subscription_id,
+            "venue": position.venue,
+            "instrument": position.instrument,
+            "side": position.side().map(|s| if s == Side::Buy { "buy" } else { "sell" }).unwrap_or(""),
+            "status": position.status,
+            "size": position.size.abs(),
+            "entryPrice": position.entry_price,
+            "markPrice": position.last_price,
+            "leverage": position.leverage,
+            "takeProfitPrice": position.take_profit_price,
+            "stopLossPrice": position.stop_loss_price
+        }))
+        .await
+    }
+
+    pub async fn add_instrument(
+        &mut self,
+        subscription_id: i64,
+        instrument: &str,
+    ) -> Result<(), SignalsClientError> {
+        self.send_json(serde_json::json!({"type": "add-instrument", "subscriptionId": subscription_id, "instrument": instrument})).await
+    }
+
+    pub async fn remove_instrument(
+        &mut self,
+        subscription_id: i64,
+        instrument: &str,
+    ) -> Result<(), SignalsClientError> {
+        self.send_json(serde_json::json!({"type": "remove-instrument", "subscriptionId": subscription_id, "instrument": instrument})).await
+    }
+
+    pub async fn update_config(
+        &mut self,
+        subscription_id: i64,
+        profit_withdraw_ratio: f64,
+    ) -> Result<(), SignalsClientError> {
+        self.send_json(serde_json::json!({"type": "update-config", "subscriptionId": subscription_id, "profitWithdrawRatio": profit_withdraw_ratio})).await
+    }
+
+    pub async fn schedule_withdrawal(
+        &mut self,
+        subscription_id: i64,
+        currency: &str,
+        amount: f64,
+    ) -> Result<(), SignalsClientError> {
+        self.send_json(serde_json::json!({"type": "schedule-withdrawal", "subscriptionId": subscription_id, "currency": currency, "amount": amount})).await
+    }
+
     /// Unsubscribes by server subscription id.
     pub async fn unsubscribe(&mut self, subscription_id: i64) -> Result<(), SignalsClientError> {
         self.send_json(serde_json::json!({
@@ -367,11 +544,13 @@ pub struct InstrumentConfig {
 /// Account state for one settlement currency.
 #[derive(Debug, Clone, Default)]
 pub struct AssetSnapshot {
+    pub venue: String,
     pub currency: String,
     pub cash: f64,
     pub available: f64,
     pub used: f64,
     pub equity: f64,
+    pub max_usage: f64,
 }
 
 /// Tracks cash, available balance, used margin, and equity as assets evolve.
@@ -548,12 +727,15 @@ pub fn production_position_manager_config() -> PositionManagerConfig {
 pub struct Position {
     pub venue: String,
     pub instrument: String,
+    pub status: String,
     pub size: f64,
     pub confidence: f64,
     pub entry_price: f64,
     pub last_price: f64,
     pub take_profit: f64,
     pub stop_loss: f64,
+    pub take_profit_price: f64,
+    pub stop_loss_price: f64,
     pub trailing_stop_activation: f64,
     pub trailing_stop_distance: f64,
     pub trailing_stop_min_profit: f64,
@@ -594,6 +776,9 @@ impl Position {
     }
 
     fn take_profit_price(&self) -> f64 {
+        if self.take_profit_price > 0.0 {
+            return self.take_profit_price;
+        }
         if self.entry_price <= 0.0 || self.take_profit <= 0.0 {
             return 0.0;
         }
@@ -605,6 +790,9 @@ impl Position {
     }
 
     fn stop_loss_price(&self) -> f64 {
+        if self.stop_loss_price > 0.0 {
+            return self.stop_loss_price;
+        }
         if self.entry_price <= 0.0 || self.stop_loss <= 0.0 {
             return 0.0;
         }
@@ -1601,7 +1789,8 @@ impl PositionManager {
         if asset.available <= 0.0 {
             return 0.0;
         }
-        let mut budget = asset.available.max(0.0);
+        let mut budget =
+            asset.available.max(0.0) * positive_or(asset.max_usage, 1.0, 0.0).clamp(0.0, 1.0);
         if self.config.available_margin_buffer > 0.0 {
             budget *= 1.0 - self.config.available_margin_buffer;
         }
@@ -2986,11 +3175,13 @@ mod tests {
         config.max_leverage = 5.0;
         let mut manager = PositionManager::new(config);
         manager.asset_manager_mut().update_asset(AssetSnapshot {
+            venue: "okx".into(),
             currency: "USDT".into(),
             cash: 1000.0,
             available: 900.0,
             used: 100.0,
             equity: 1000.0,
+            max_usage: 1.0,
         });
         manager
             .instrument_manager_mut()
@@ -3348,11 +3539,13 @@ mod tests {
         config.rebalance_interval = Duration::from_secs(6 * 60 * 60);
         let mut manager = PositionManager::new(config);
         manager.asset_manager_mut().update_asset(AssetSnapshot {
+            venue: "okx".into(),
             currency: "USDT".into(),
             cash: 1000.0,
             available: 0.5,
             used: 999.5,
             equity: 1000.0,
+            max_usage: 1.0,
         });
         manager
             .instrument_manager_mut()
@@ -3397,11 +3590,13 @@ mod tests {
     fn stats_report_instrument_and_currency_pnl() {
         let mut manager = PositionManager::new(production_position_manager_config());
         manager.asset_manager_mut().update_asset(AssetSnapshot {
+            venue: "okx".into(),
             currency: "USDT".into(),
             cash: 1000.0,
             available: 800.0,
             used: 200.0,
             equity: 1000.0,
+            max_usage: 1.0,
         });
         manager
             .instrument_manager_mut()
