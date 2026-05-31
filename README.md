@@ -8,7 +8,7 @@ Grexie Signals is a real-time crypto trading signal service that streams model-b
 
 ```toml
 [dependencies]
-grexie-signals-client = "0.1.19"
+grexie-signals-client = "0.1.20"
 ```
 
 ## Websocket Client
