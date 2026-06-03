@@ -1,6 +1,7 @@
 //! Typed Rust client for the Grexie Signals router websocket protocol.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
@@ -8,6 +9,7 @@ use http::Request;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::net::TcpStream;
+use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
@@ -876,15 +878,25 @@ impl SignalsManager {
             .await
     }
 
-    /// Receives one event and applies it to manager state.
+    /// Receives one event, reconnecting and resubscribing with current state
+    /// after transient websocket drops.
     pub async fn run_next(&mut self) -> Result<Option<SignalsEvent>, SignalsClientError> {
-        let Some(event) = self.client.receive().await? else {
-            return Ok(None);
-        };
-        if self.handle_event(&event) {
-            Ok(Some(event))
-        } else {
-            Ok(None)
+        let mut backoff = Duration::from_secs(1);
+        loop {
+            match self.client.receive().await {
+                Ok(Some(event)) => {
+                    if self.handle_event(&event) {
+                        return Ok(Some(event));
+                    }
+                }
+                Ok(None) => {
+                    self.reconnect_and_subscribe(&mut backoff).await?;
+                }
+                Err(err) if is_reconnectable_error(&err) => {
+                    self.reconnect_and_subscribe(&mut backoff).await?;
+                }
+                Err(err) => return Err(err),
+            }
         }
     }
 
@@ -894,9 +906,11 @@ impl SignalsManager {
             return Ok(());
         };
         if self.subscription_id > 0 {
-            self.client
-                .update_asset(self.subscription_id, &asset)
-                .await?;
+            match self.client.update_asset(self.subscription_id, &asset).await {
+                Ok(()) => {}
+                Err(err) if is_reconnectable_error(&err) => {}
+                Err(err) => return Err(err),
+            }
         }
         Ok(())
     }
@@ -907,9 +921,15 @@ impl SignalsManager {
             return Ok(());
         };
         if self.subscription_id > 0 {
-            self.client
+            match self
+                .client
                 .update_position(self.subscription_id, &position)
-                .await?;
+                .await
+            {
+                Ok(()) => {}
+                Err(err) if is_reconnectable_error(&err) => {}
+                Err(err) => return Err(err),
+            }
         }
         Ok(())
     }
@@ -923,9 +943,15 @@ impl SignalsManager {
         self.cfg.instruments.push(instrument.clone());
         self.cfg.instruments = normalize_instrument_list(std::mem::take(&mut self.cfg.instruments));
         if self.subscription_id > 0 {
-            self.client
+            match self
+                .client
                 .add_instrument(self.subscription_id, &instrument)
-                .await?;
+                .await
+            {
+                Ok(()) => {}
+                Err(err) if is_reconnectable_error(&err) => {}
+                Err(err) => return Err(err),
+            }
         }
         Ok(())
     }
@@ -937,9 +963,15 @@ impl SignalsManager {
             .instruments
             .retain(|current| current != &instrument);
         if self.subscription_id > 0 {
-            self.client
+            match self
+                .client
                 .remove_instrument(self.subscription_id, &instrument)
-                .await?;
+                .await
+            {
+                Ok(()) => {}
+                Err(err) if is_reconnectable_error(&err) => {}
+                Err(err) => return Err(err),
+            }
         }
         Ok(())
     }
@@ -953,9 +985,15 @@ impl SignalsManager {
         ));
         self.cfg.profit_withdraw_ratio = config.profit_withdraw_ratio;
         if self.subscription_id > 0 {
-            self.client
+            match self
+                .client
                 .update_config(self.subscription_id, config)
-                .await?;
+                .await
+            {
+                Ok(()) => {}
+                Err(err) if is_reconnectable_error(&err) => {}
+                Err(err) => return Err(err),
+            }
         }
         Ok(())
     }
@@ -1056,6 +1094,29 @@ impl SignalsManager {
             .unwrap_or(0.0)
     }
 
+    async fn reconnect_and_subscribe(
+        &mut self,
+        backoff: &mut Duration,
+    ) -> Result<(), SignalsClientError> {
+        self.subscription_id = 0;
+        loop {
+            match self.client.connect().await {
+                Ok(()) => match self.subscribe().await {
+                    Ok(()) => {
+                        *backoff = Duration::from_secs(1);
+                        return Ok(());
+                    }
+                    Err(err) if is_reconnectable_error(&err) => {}
+                    Err(err) => return Err(err),
+                },
+                Err(err) if is_reconnectable_error(&err) => {}
+                Err(err) => return Err(err),
+            }
+            sleep(*backoff).await;
+            *backoff = (*backoff * 2).min(Duration::from_secs(30));
+        }
+    }
+
     fn accepts_event(&self, event: &SignalsEvent) -> bool {
         let subscription_id = event_subscription_id(event);
         if self.subscription_id > 0 && subscription_id > 0 {
@@ -1126,6 +1187,13 @@ impl SignalsManager {
         }
         Some(position)
     }
+}
+
+fn is_reconnectable_error(err: &SignalsClientError) -> bool {
+    matches!(
+        err,
+        SignalsClientError::NotConnected | SignalsClientError::WebSocket(_)
+    )
 }
 
 fn normalize_manager_config(mut cfg: SignalsManagerConfig) -> SignalsManagerConfig {
