@@ -72,8 +72,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             SignalsEvent::Withdraw { currency, amount, .. } => {
                 println!("withdraw currency={currency} amount={amount}");
             }
-            SignalsEvent::Info { instrument, stage, message, .. } => {
-                println!("info instrument={instrument} stage={stage} message=\"{message}\"");
+            SignalsEvent::Info { instrument, level, stage, message, .. } => {
+                println!("info level={level} instrument={instrument} stage={stage} message=\"{message}\"");
             }
             _ => {}
         }

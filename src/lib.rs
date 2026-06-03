@@ -254,6 +254,7 @@ pub enum SignalsEvent {
         subscription_id: i64,
         venue: String,
         instrument: String,
+        level: String,
         stage: String,
         message: String,
         timestamp: Option<String>,
@@ -336,6 +337,7 @@ struct RawEvent {
     code: Option<String>,
     message: Option<String>,
     stage: Option<String>,
+    level: Option<String>,
     timestamp: Option<String>,
     replay: Option<bool>,
     replayed_at: Option<String>,
@@ -410,6 +412,7 @@ pub fn parse_event(raw: &str) -> Result<SignalsEvent, SignalsClientError> {
             subscription_id: msg.subscription_id.unwrap_or_default(),
             venue: msg.venue.unwrap_or_default(),
             instrument: msg.instrument.unwrap_or_default(),
+            level: normalize_info_level(msg.level),
             stage: msg.stage.unwrap_or_default(),
             message: msg.message.unwrap_or_default(),
             timestamp: msg.timestamp,
@@ -1226,6 +1229,20 @@ fn normalize_instrument(instrument: &str) -> String {
     instrument.trim().to_uppercase()
 }
 
+fn normalize_info_level(level: Option<String>) -> String {
+    match level
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "error" => "error".to_string(),
+        "warn" => "warn".to_string(),
+        "debug" => "debug".to_string(),
+        _ => "info".to_string(),
+    }
+}
+
 fn normalize_instrument_list(instruments: Vec<String>) -> Vec<String> {
     let mut out: Vec<_> = instruments
         .into_iter()
@@ -1328,6 +1345,23 @@ mod tests {
                 assert!(signal.manage_positions_only);
                 assert!(replay);
             }
+            other => panic!("unexpected event {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_info_event_level() {
+        let event = parse_event(r#"{"type":"info","subscriptionId":4,"venue":"okx","instrument":"BTC-USDT-SWAP","level":"debug","stage":"ready","message":"ready"}"#).unwrap();
+        match event {
+            SignalsEvent::Info { level, stage, .. } => {
+                assert_eq!(level, "debug");
+                assert_eq!(stage, "ready");
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+        let event = parse_event(r#"{"type":"info","subscriptionId":4,"venue":"okx","instrument":"BTC-USDT-SWAP","stage":"ready","message":"ready"}"#).unwrap();
+        match event {
+            SignalsEvent::Info { level, .. } => assert_eq!(level, "info"),
             other => panic!("unexpected event {other:?}"),
         }
     }
