@@ -2,7 +2,7 @@
 name = "grexie-signals-client"
 version = "0.1.21"
 edition = "2021"
-description = "Typed Rust client for Grexie Signals websocket subscriptions and position management."
+description = "Typed Rust client for Grexie Signals websocket subscriptions and router intents."
 license = "MIT"
 repository = "https://github.com/grexie/signals-client-rust"
 homepage = "https://github.com/grexie/signals-client-rust"
