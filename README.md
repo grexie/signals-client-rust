@@ -4,7 +4,7 @@ Typed Rust client for the Grexie Signals router websocket protocol.
 
 ```toml
 [dependencies]
-grexie-signals-client = "0.1.22"
+grexie-signals-client = "0.1.23"
 ```
 
 ## SignalsManager

@@ -238,6 +238,18 @@ pub enum SignalsEvent {
         code: Option<String>,
         message: Option<String>,
     },
+    BasketUpdated {
+        subscription_id: i64,
+        venue: Option<String>,
+        basket_id: Option<String>,
+        message: Option<String>,
+    },
+    OrderRouterForwarded {
+        subscription_id: i64,
+        venue: Option<String>,
+        basket_id: Option<String>,
+        message: Option<String>,
+    },
     Info {
         subscription_id: i64,
         venue: String,
@@ -320,6 +332,7 @@ struct RawEvent {
     subscription_id: Option<i64>,
     venue: Option<String>,
     instrument: Option<String>,
+    basket_id: Option<String>,
     code: Option<String>,
     message: Option<String>,
     stage: Option<String>,
@@ -379,6 +392,18 @@ pub fn parse_event(raw: &str) -> Result<SignalsEvent, SignalsClientError> {
             venue: msg.venue,
             instrument: msg.instrument,
             code: msg.code,
+            message: msg.message,
+        }),
+        "basket_updated" => Ok(SignalsEvent::BasketUpdated {
+            subscription_id: msg.subscription_id.unwrap_or_default(),
+            venue: msg.venue,
+            basket_id: msg.basket_id,
+            message: msg.message,
+        }),
+        "order_router_forwarded" => Ok(SignalsEvent::OrderRouterForwarded {
+            subscription_id: msg.subscription_id.unwrap_or_default(),
+            venue: msg.venue,
+            basket_id: msg.basket_id,
             message: msg.message,
         }),
         "info" => Ok(SignalsEvent::Info {
@@ -467,6 +492,18 @@ pub fn parse_event(raw: &str) -> Result<SignalsEvent, SignalsClientError> {
         }),
         other => Err(SignalsClientError::UnsupportedEvent(other.to_string())),
     }
+}
+
+fn ignore_websocket_message(raw: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|msg| {
+            msg.get("type")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+        })
+        .as_deref()
+        == Some("basket_state")
 }
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -603,7 +640,8 @@ impl SignalsClient {
             "minLeverage": config.min_leverage,
             "maxLeverage": config.max_leverage,
             "profitWithdrawRatio": config.profit_withdraw_ratio
-        })).await
+        }))
+        .await
     }
 
     /// Schedules a withdrawal request for the router subscription.
@@ -626,14 +664,25 @@ impl SignalsClient {
     /// Receives and parses the next websocket event.
     pub async fn receive(&mut self) -> Result<Option<SignalsEvent>, SignalsClientError> {
         let read = self.read.as_mut().ok_or(SignalsClientError::NotConnected)?;
-        match read.next().await {
-            Some(Ok(Message::Text(text))) => Ok(Some(parse_event(&text)?)),
-            Some(Ok(Message::Binary(bytes))) => Ok(Some(parse_event(
-                std::str::from_utf8(&bytes).unwrap_or(""),
-            )?)),
-            Some(Ok(_)) => Ok(None),
-            Some(Err(err)) => Err(err.into()),
-            None => Ok(None),
+        loop {
+            match read.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    if ignore_websocket_message(&text) {
+                        continue;
+                    }
+                    return Ok(Some(parse_event(&text)?));
+                }
+                Some(Ok(Message::Binary(bytes))) => {
+                    let text = std::str::from_utf8(&bytes).unwrap_or("");
+                    if ignore_websocket_message(text) {
+                        continue;
+                    }
+                    return Ok(Some(parse_event(text)?));
+                }
+                Some(Ok(_)) => return Ok(None),
+                Some(Err(err)) => return Err(err.into()),
+                None => return Ok(None),
+            }
         }
     }
 
@@ -895,7 +944,10 @@ impl SignalsManager {
     /// Applies and optionally sends a runtime router config patch.
     pub async fn update_config(&mut self, config: RuntimeConfig) -> Result<(), SignalsClientError> {
         let config = normalize_runtime_config(config);
-        self.cfg.risk = Some(apply_runtime_config_to_risk(self.cfg.risk.unwrap_or_default(), config));
+        self.cfg.risk = Some(apply_runtime_config_to_risk(
+            self.cfg.risk.unwrap_or_default(),
+            config,
+        ));
         self.cfg.profit_withdraw_ratio = config.profit_withdraw_ratio;
         if self.subscription_id > 0 {
             self.client
@@ -1195,6 +1247,12 @@ fn event_subscription_id(event: &SignalsEvent) -> i64 {
         SignalsEvent::Subscribed {
             subscription_id, ..
         }
+        | SignalsEvent::BasketUpdated {
+            subscription_id, ..
+        }
+        | SignalsEvent::OrderRouterForwarded {
+            subscription_id, ..
+        }
         | SignalsEvent::Info {
             subscription_id, ..
         }
@@ -1276,6 +1334,28 @@ mod tests {
 
     #[test]
     fn parses_router_events() {
+        let basket_updated = parse_event(
+            r#"{"type":"basket_updated","subscriptionId":12,"venue":"okx","message":"active"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            basket_updated,
+            SignalsEvent::BasketUpdated {
+                subscription_id: 12,
+                ..
+            }
+        ));
+
+        let forwarded =
+            parse_event(r#"{"type":"order_router_forwarded","subscriptionId":12}"#).unwrap();
+        assert!(matches!(
+            forwarded,
+            SignalsEvent::OrderRouterForwarded {
+                subscription_id: 12,
+                ..
+            }
+        ));
+
         let order = parse_event(r#"{"type":"create-market-order","subscriptionId":12,"intentId":"intent_1","reason":"preempted_by_better_route","venue":"okx","instrument":"BTC-USDT-SWAP","side":"buy","contractSize":3,"margin":125.5,"leverage":1.46,"confidence":0.73}"#).unwrap();
         match order {
             SignalsEvent::CreateMarketOrder {
