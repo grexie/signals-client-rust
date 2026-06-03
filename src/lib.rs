@@ -169,6 +169,8 @@ pub struct Position {
     #[serde(default)]
     pub trailing_stop_min_profit: f64,
     #[serde(default)]
+    pub margin: f64,
+    #[serde(default)]
     pub leverage: f64,
     #[serde(default)]
     pub mfe: f64,
@@ -263,7 +265,9 @@ pub enum SignalsEvent {
         side: String,
         order_type: Option<String>,
         contract_size: f64,
+        margin: f64,
         leverage: f64,
+        confidence: f64,
         reduce_only: bool,
         take_profit_price: f64,
         stop_loss_price: f64,
@@ -321,7 +325,9 @@ struct RawEvent {
     side: Option<String>,
     order_type: Option<String>,
     contract_size: Option<f64>,
+    margin: Option<f64>,
     leverage: Option<f64>,
+    confidence: Option<f64>,
     reduce_only: Option<bool>,
     take_profit_price: Option<f64>,
     stop_loss_price: Option<f64>,
@@ -415,7 +421,9 @@ pub fn parse_event(raw: &str) -> Result<SignalsEvent, SignalsClientError> {
             side: msg.side.unwrap_or_default(),
             order_type: msg.order_type,
             contract_size: msg.contract_size.unwrap_or_default(),
+            margin: msg.margin.unwrap_or_default(),
             leverage: msg.leverage.unwrap_or_default(),
+            confidence: msg.confidence.unwrap_or_default(),
             reduce_only: msg.reduce_only.unwrap_or(false),
             take_profit_price: msg.take_profit_price.unwrap_or_default(),
             stop_loss_price: msg.stop_loss_price.unwrap_or_default(),
@@ -489,22 +497,41 @@ impl SignalsClient {
         Ok(())
     }
 
-    pub async fn subscribe(&mut self, venue: &str, instrument: &str) -> Result<(), SignalsClientError> {
-        self.send_json(serde_json::json!({"type": "subscribe", "venue": venue, "instrument": instrument})).await
+    pub async fn subscribe(
+        &mut self,
+        venue: &str,
+        instrument: &str,
+    ) -> Result<(), SignalsClientError> {
+        self.send_json(
+            serde_json::json!({"type": "subscribe", "venue": venue, "instrument": instrument}),
+        )
+        .await
     }
 
-    pub async fn subscribe_basket(&mut self, request: SubscribeRequest) -> Result<(), SignalsClientError> {
-        self.send_json(serde_json::to_value(request.normalized())?).await
+    pub async fn subscribe_basket(
+        &mut self,
+        request: SubscribeRequest,
+    ) -> Result<(), SignalsClientError> {
+        self.send_json(serde_json::to_value(request.normalized())?)
+            .await
     }
 
-    pub async fn update_asset(&mut self, subscription_id: i64, asset: &AssetSnapshot) -> Result<(), SignalsClientError> {
+    pub async fn update_asset(
+        &mut self,
+        subscription_id: i64,
+        asset: &AssetSnapshot,
+    ) -> Result<(), SignalsClientError> {
         let mut payload = serde_json::to_value(asset)?;
         payload["type"] = serde_json::json!("update-asset");
         payload["subscriptionId"] = serde_json::json!(subscription_id);
         self.send_json(payload).await
     }
 
-    pub async fn update_position(&mut self, subscription_id: i64, position: &Position) -> Result<(), SignalsClientError> {
+    pub async fn update_position(
+        &mut self,
+        subscription_id: i64,
+        position: &Position,
+    ) -> Result<(), SignalsClientError> {
         self.send_json(serde_json::json!({
             "type": "update-position",
             "subscriptionId": subscription_id,
@@ -515,37 +542,59 @@ impl SignalsClient {
             "size": position.size.abs(),
             "entryPrice": position.entry_price,
             "markPrice": position.last_price,
+            "margin": position.margin,
             "leverage": position.leverage,
             "takeProfitPrice": position.take_profit_price,
             "stopLossPrice": position.stop_loss_price
         })).await
     }
 
-    pub async fn add_instrument(&mut self, subscription_id: i64, instrument: &str) -> Result<(), SignalsClientError> {
+    pub async fn add_instrument(
+        &mut self,
+        subscription_id: i64,
+        instrument: &str,
+    ) -> Result<(), SignalsClientError> {
         self.send_json(serde_json::json!({"type": "add-instrument", "subscriptionId": subscription_id, "instrument": normalize_instrument(instrument)})).await
     }
 
-    pub async fn remove_instrument(&mut self, subscription_id: i64, instrument: &str) -> Result<(), SignalsClientError> {
+    pub async fn remove_instrument(
+        &mut self,
+        subscription_id: i64,
+        instrument: &str,
+    ) -> Result<(), SignalsClientError> {
         self.send_json(serde_json::json!({"type": "remove-instrument", "subscriptionId": subscription_id, "instrument": normalize_instrument(instrument)})).await
     }
 
-    pub async fn update_config(&mut self, subscription_id: i64, config: RuntimeConfig) -> Result<(), SignalsClientError> {
+    pub async fn update_config(
+        &mut self,
+        subscription_id: i64,
+        config: RuntimeConfig,
+    ) -> Result<(), SignalsClientError> {
         self.send_json(serde_json::json!({"type": "update-config", "subscriptionId": subscription_id, "profitWithdrawRatio": clamp01(config.profit_withdraw_ratio)})).await
     }
 
-    pub async fn schedule_withdrawal(&mut self, subscription_id: i64, withdrawal: WithdrawalRequest) -> Result<(), SignalsClientError> {
+    pub async fn schedule_withdrawal(
+        &mut self,
+        subscription_id: i64,
+        withdrawal: WithdrawalRequest,
+    ) -> Result<(), SignalsClientError> {
         self.send_json(serde_json::json!({"type": "schedule-withdrawal", "subscriptionId": subscription_id, "venue": withdrawal.venue, "currency": withdrawal.currency, "amount": withdrawal.amount, "reason": withdrawal.reason})).await
     }
 
     pub async fn unsubscribe(&mut self, subscription_id: i64) -> Result<(), SignalsClientError> {
-        self.send_json(serde_json::json!({"type": "unsubscribe", "subscriptionId": subscription_id})).await
+        self.send_json(
+            serde_json::json!({"type": "unsubscribe", "subscriptionId": subscription_id}),
+        )
+        .await
     }
 
     pub async fn receive(&mut self) -> Result<Option<SignalsEvent>, SignalsClientError> {
         let read = self.read.as_mut().ok_or(SignalsClientError::NotConnected)?;
         match read.next().await {
             Some(Ok(Message::Text(text))) => Ok(Some(parse_event(&text)?)),
-            Some(Ok(Message::Binary(bytes))) => Ok(Some(parse_event(std::str::from_utf8(&bytes).unwrap_or(""))?)),
+            Some(Ok(Message::Binary(bytes))) => Ok(Some(parse_event(
+                std::str::from_utf8(&bytes).unwrap_or(""),
+            )?)),
             Some(Ok(_)) => Ok(None),
             Some(Err(err)) => Err(err.into()),
             None => Ok(None),
@@ -553,7 +602,10 @@ impl SignalsClient {
     }
 
     async fn send_json(&mut self, payload: serde_json::Value) -> Result<(), SignalsClientError> {
-        let write = self.write.as_mut().ok_or(SignalsClientError::NotConnected)?;
+        let write = self
+            .write
+            .as_mut()
+            .ok_or(SignalsClientError::NotConnected)?;
         write.send(Message::Text(payload.to_string())).await?;
         Ok(())
     }
@@ -637,7 +689,11 @@ pub struct SignalsManager {
 }
 
 impl SignalsManager {
-    pub fn new(client: SignalsClient, state: SignalsManagerState, cfg: SignalsManagerConfig) -> Self {
+    pub fn new(
+        client: SignalsClient,
+        state: SignalsManagerState,
+        cfg: SignalsManagerConfig,
+    ) -> Self {
         let mut manager = Self {
             client,
             cfg: normalize_manager_config(cfg),
@@ -663,16 +719,18 @@ impl SignalsManager {
     }
 
     pub async fn subscribe(&mut self) -> Result<(), SignalsClientError> {
-        self.client.subscribe_basket(SubscribeRequest {
-            request_type: "subscribe".into(),
-            venue: self.cfg.venue.clone(),
-            instruments: self.cfg.instruments.clone(),
-            mode: self.cfg.mode.clone(),
-            risk: self.cfg.risk.clone(),
-            profit_withdraw_ratio: self.cfg.profit_withdraw_ratio,
-            assets: self.assets(),
-            positions: self.positions(),
-        }).await
+        self.client
+            .subscribe_basket(SubscribeRequest {
+                request_type: "subscribe".into(),
+                venue: self.cfg.venue.clone(),
+                instruments: self.cfg.instruments.clone(),
+                mode: self.cfg.mode.clone(),
+                risk: self.cfg.risk.clone(),
+                profit_withdraw_ratio: self.cfg.profit_withdraw_ratio,
+                assets: self.assets(),
+                positions: self.positions(),
+            })
+            .await
     }
 
     pub async fn run_next(&mut self) -> Result<Option<SignalsEvent>, SignalsClientError> {
@@ -691,7 +749,9 @@ impl SignalsManager {
             return Ok(());
         };
         if self.subscription_id > 0 {
-            self.client.update_asset(self.subscription_id, &asset).await?;
+            self.client
+                .update_asset(self.subscription_id, &asset)
+                .await?;
         }
         Ok(())
     }
@@ -701,7 +761,9 @@ impl SignalsManager {
             return Ok(());
         };
         if self.subscription_id > 0 {
-            self.client.update_position(self.subscription_id, &position).await?;
+            self.client
+                .update_position(self.subscription_id, &position)
+                .await?;
         }
         Ok(())
     }
@@ -714,16 +776,22 @@ impl SignalsManager {
         self.cfg.instruments.push(instrument.clone());
         self.cfg.instruments = normalize_instrument_list(std::mem::take(&mut self.cfg.instruments));
         if self.subscription_id > 0 {
-            self.client.add_instrument(self.subscription_id, &instrument).await?;
+            self.client
+                .add_instrument(self.subscription_id, &instrument)
+                .await?;
         }
         Ok(())
     }
 
     pub async fn remove_instrument(&mut self, instrument: &str) -> Result<(), SignalsClientError> {
         let instrument = normalize_instrument(instrument);
-        self.cfg.instruments.retain(|current| current != &instrument);
+        self.cfg
+            .instruments
+            .retain(|current| current != &instrument);
         if self.subscription_id > 0 {
-            self.client.remove_instrument(self.subscription_id, &instrument).await?;
+            self.client
+                .remove_instrument(self.subscription_id, &instrument)
+                .await?;
         }
         Ok(())
     }
@@ -731,16 +799,23 @@ impl SignalsManager {
     pub async fn update_config(&mut self, config: RuntimeConfig) -> Result<(), SignalsClientError> {
         self.cfg.profit_withdraw_ratio = clamp01(config.profit_withdraw_ratio);
         if self.subscription_id > 0 {
-            self.client.update_config(self.subscription_id, config).await?;
+            self.client
+                .update_config(self.subscription_id, config)
+                .await?;
         }
         Ok(())
     }
 
-    pub async fn schedule_withdrawal(&mut self, withdrawal: WithdrawalRequest) -> Result<(), SignalsClientError> {
+    pub async fn schedule_withdrawal(
+        &mut self,
+        withdrawal: WithdrawalRequest,
+    ) -> Result<(), SignalsClientError> {
         if self.subscription_id <= 0 {
             return Err(SignalsClientError::NotSubscribed);
         }
-        self.client.schedule_withdrawal(self.subscription_id, withdrawal).await
+        self.client
+            .schedule_withdrawal(self.subscription_id, withdrawal)
+            .await
     }
 
     pub fn handle_event(&mut self, event: &SignalsEvent) -> bool {
@@ -748,13 +823,25 @@ impl SignalsManager {
             return false;
         }
         match event {
-            SignalsEvent::Subscribed { subscription_id, .. } if *subscription_id > 0 => {
+            SignalsEvent::Subscribed {
+                subscription_id, ..
+            } if *subscription_id > 0 => {
                 self.subscription_id = *subscription_id;
             }
-            SignalsEvent::Unsubscribed { subscription_id, .. } if *subscription_id == Some(self.subscription_id) => {
+            SignalsEvent::Unsubscribed {
+                subscription_id, ..
+            } if *subscription_id == Some(self.subscription_id) => {
                 self.subscription_id = 0;
             }
-            SignalsEvent::UpdateTPSL { venue, instrument, take_profit, stop_loss, take_profit_price, stop_loss_price, .. } => {
+            SignalsEvent::UpdateTPSL {
+                venue,
+                instrument,
+                take_profit,
+                stop_loss,
+                take_profit_price,
+                stop_loss_price,
+                ..
+            } => {
                 let key = position_key(venue.as_deref().unwrap_or(&self.cfg.venue), instrument);
                 if let Some(position) = self.positions.get_mut(&key) {
                     if *take_profit > 0.0 {
@@ -788,7 +875,9 @@ impl SignalsManager {
 
     pub fn positions(&self) -> Vec<Position> {
         let mut out: Vec<_> = self.positions.values().cloned().collect();
-        out.sort_by(|a, b| position_key(&a.venue, &a.instrument).cmp(&position_key(&b.venue, &b.instrument)));
+        out.sort_by(|a, b| {
+            position_key(&a.venue, &a.instrument).cmp(&position_key(&b.venue, &b.instrument))
+        });
         out
     }
 
@@ -812,12 +901,24 @@ impl SignalsManager {
             return subscription_id == self.subscription_id;
         }
         match event {
-            SignalsEvent::Subscribed { venue, instrument, .. } => instrument_in_config(&self.cfg, venue, instrument),
-            SignalsEvent::Info { venue, instrument, .. }
-            | SignalsEvent::Backtest { venue, instrument, .. }
-            | SignalsEvent::Signal { venue, instrument, .. } => instrument_in_config(&self.cfg, venue, instrument),
-            SignalsEvent::CreateMarketOrder { venue, instrument, .. }
-            | SignalsEvent::UpdateTPSL { venue, instrument, .. } => instrument_in_config(&self.cfg, venue.as_deref().unwrap_or(""), instrument),
+            SignalsEvent::Subscribed {
+                venue, instrument, ..
+            } => instrument_in_config(&self.cfg, venue, instrument),
+            SignalsEvent::Info {
+                venue, instrument, ..
+            }
+            | SignalsEvent::Backtest {
+                venue, instrument, ..
+            }
+            | SignalsEvent::Signal {
+                venue, instrument, ..
+            } => instrument_in_config(&self.cfg, venue, instrument),
+            SignalsEvent::CreateMarketOrder {
+                venue, instrument, ..
+            }
+            | SignalsEvent::UpdateTPSL {
+                venue, instrument, ..
+            } => instrument_in_config(&self.cfg, venue.as_deref().unwrap_or(""), instrument),
             _ => true,
         }
     }
@@ -845,13 +946,14 @@ impl SignalsManager {
             position.venue = self.cfg.venue.clone();
         }
         position.venue = normalize_venue(&position.venue);
-        position.status = if position.status.trim().is_empty() && position.size.abs() > FLOAT_TOLERANCE {
-            "open".into()
-        } else if position.status.trim().is_empty() {
-            "closed".into()
-        } else {
-            position.status.trim().to_lowercase()
-        };
+        position.status =
+            if position.status.trim().is_empty() && position.size.abs() > FLOAT_TOLERANCE {
+                "open".into()
+            } else if position.status.trim().is_empty() {
+                "closed".into()
+            } else {
+                position.status.trim().to_lowercase()
+            };
         if position.last_price <= 0.0 {
             position.last_price = position.entry_price;
         }
@@ -874,7 +976,11 @@ fn normalize_manager_config(mut cfg: SignalsManagerConfig) -> SignalsManagerConf
 
 fn normalize_venue(venue: &str) -> String {
     let trimmed = venue.trim().to_lowercase();
-    if trimmed.is_empty() { "okx".into() } else { trimmed }
+    if trimmed.is_empty() {
+        "okx".into()
+    } else {
+        trimmed
+    }
 }
 
 fn normalize_instrument(instrument: &str) -> String {
@@ -882,32 +988,57 @@ fn normalize_instrument(instrument: &str) -> String {
 }
 
 fn normalize_instrument_list(instruments: Vec<String>) -> Vec<String> {
-    let mut out: Vec<_> = instruments.into_iter().map(|item| normalize_instrument(&item)).filter(|item| !item.is_empty()).collect();
+    let mut out: Vec<_> = instruments
+        .into_iter()
+        .map(|item| normalize_instrument(&item))
+        .filter(|item| !item.is_empty())
+        .collect();
     out.sort();
     out.dedup();
     out
 }
 
 fn instrument_in_config(cfg: &SignalsManagerConfig, venue: &str, instrument: &str) -> bool {
-    normalize_venue(venue) == cfg.venue && (instrument.is_empty() || cfg.instruments.contains(&normalize_instrument(instrument)))
+    normalize_venue(venue) == cfg.venue
+        && (instrument.is_empty() || cfg.instruments.contains(&normalize_instrument(instrument)))
 }
 
 fn event_subscription_id(event: &SignalsEvent) -> i64 {
     match event {
-        SignalsEvent::Subscribed { subscription_id, .. }
-        | SignalsEvent::Info { subscription_id, .. }
-        | SignalsEvent::Backtest { subscription_id, .. }
-        | SignalsEvent::Signal { subscription_id, .. }
-        | SignalsEvent::CreateMarketOrder { subscription_id, .. }
-        | SignalsEvent::UpdateTPSL { subscription_id, .. }
-        | SignalsEvent::Withdraw { subscription_id, .. } => *subscription_id,
-        SignalsEvent::Unsubscribed { subscription_id, .. } => subscription_id.unwrap_or_default(),
+        SignalsEvent::Subscribed {
+            subscription_id, ..
+        }
+        | SignalsEvent::Info {
+            subscription_id, ..
+        }
+        | SignalsEvent::Backtest {
+            subscription_id, ..
+        }
+        | SignalsEvent::Signal {
+            subscription_id, ..
+        }
+        | SignalsEvent::CreateMarketOrder {
+            subscription_id, ..
+        }
+        | SignalsEvent::UpdateTPSL {
+            subscription_id, ..
+        }
+        | SignalsEvent::Withdraw {
+            subscription_id, ..
+        } => *subscription_id,
+        SignalsEvent::Unsubscribed {
+            subscription_id, ..
+        } => subscription_id.unwrap_or_default(),
         _ => 0,
     }
 }
 
 fn position_key(venue: &str, instrument: &str) -> String {
-    format!("{}:{}", normalize_venue(venue), normalize_instrument(instrument))
+    format!(
+        "{}:{}",
+        normalize_venue(venue),
+        normalize_instrument(instrument)
+    )
 }
 
 fn clamp01(value: f64) -> f64 {
@@ -919,7 +1050,11 @@ fn clamp01(value: f64) -> f64 {
 }
 
 fn positive_or(a: f64, b: f64) -> f64 {
-    if a > 0.0 { a } else { b.max(0.0) }
+    if a > 0.0 {
+        a
+    } else {
+        b.max(0.0)
+    }
 }
 
 fn is_zero(value: &f64) -> bool {
@@ -934,7 +1069,12 @@ mod tests {
     fn parses_signal_replay_event() {
         let event = parse_event(r#"{"type":"signal","subscriptionId":4,"venue":"okx","instrument":"BTC-USDT-SWAP","timestamp":"2026-05-26T00:00:00Z","replay":true,"signal":{"confidence":0.8,"side":"buy","takeProfit":0.01,"stopLoss":0.004,"trailingStopActivation":0.02,"trailingStopDistance":0.01,"trailingStopMinProfit":0.001,"managePositionsOnly":true}}"#).unwrap();
         match event {
-            SignalsEvent::Signal { subscription_id, signal, replay, .. } => {
+            SignalsEvent::Signal {
+                subscription_id,
+                signal,
+                replay,
+                ..
+            } => {
                 assert_eq!(subscription_id, 4);
                 assert_eq!(signal.venue, "okx");
                 assert_eq!(signal.instrument, "BTC-USDT-SWAP");
@@ -949,18 +1089,33 @@ mod tests {
 
     #[test]
     fn parses_router_events() {
-        let order = parse_event(r#"{"type":"create-market-order","subscriptionId":12,"intentId":"intent_1","reason":"preempted_by_better_route","venue":"okx","instrument":"BTC-USDT-SWAP","side":"buy","contractSize":3}"#).unwrap();
+        let order = parse_event(r#"{"type":"create-market-order","subscriptionId":12,"intentId":"intent_1","reason":"preempted_by_better_route","venue":"okx","instrument":"BTC-USDT-SWAP","side":"buy","contractSize":3,"margin":125.5,"leverage":1.46,"confidence":0.73}"#).unwrap();
         match order {
-            SignalsEvent::CreateMarketOrder { intent_id, reason, contract_size, .. } => {
+            SignalsEvent::CreateMarketOrder {
+                intent_id,
+                reason,
+                contract_size,
+                margin,
+                leverage,
+                confidence,
+                ..
+            } => {
                 assert_eq!(intent_id.as_deref(), Some("intent_1"));
                 assert_eq!(reason.as_deref(), Some("preempted_by_better_route"));
                 assert_eq!(contract_size, 3.0);
+                assert_eq!(margin, 125.5);
+                assert_eq!(leverage, 1.46);
+                assert_eq!(confidence, 0.73);
             }
             other => panic!("unexpected event {other:?}"),
         }
         let tpsl = parse_event(r#"{"type":"update-tpsl","subscriptionId":12,"intentId":"intent_2","venue":"okx","instrument":"BTC-USDT-SWAP","side":"buy","takeProfitPrice":72100,"stopLossPrice":70050,"takeProfit":0.03,"stopLoss":0.0007}"#).unwrap();
         match tpsl {
-            SignalsEvent::UpdateTPSL { take_profit_price, stop_loss_price, .. } => {
+            SignalsEvent::UpdateTPSL {
+                take_profit_price,
+                stop_loss_price,
+                ..
+            } => {
                 assert_eq!(take_profit_price, 72100.0);
                 assert_eq!(stop_loss_price, 70050.0);
             }
@@ -970,18 +1125,39 @@ mod tests {
 
     #[test]
     fn signals_manager_tracks_snapshots_and_server_updates() {
-        let client = SignalsClient::with_url(SignalsWebSocketToken(String::new()), "ws://127.0.0.1:1");
+        let client =
+            SignalsClient::with_url(SignalsWebSocketToken(String::new()), "ws://127.0.0.1:1");
         let mut manager = SignalsManager::new(
             client,
             SignalsManagerState {
-                assets: vec![AssetSnapshot { venue: "okx".into(), currency: "usdt".into(), available: 50.0, max_usage: 0.5, ..Default::default() }],
-                positions: vec![Position { venue: "okx".into(), instrument: "eth-usdt-swap".into(), size: -4.0, entry_price: 2000.0, ..Default::default() }],
+                assets: vec![AssetSnapshot {
+                    venue: "okx".into(),
+                    currency: "usdt".into(),
+                    available: 50.0,
+                    max_usage: 0.5,
+                    ..Default::default()
+                }],
+                positions: vec![Position {
+                    venue: "okx".into(),
+                    instrument: "eth-usdt-swap".into(),
+                    size: -4.0,
+                    entry_price: 2000.0,
+                    ..Default::default()
+                }],
             },
-            SignalsManagerConfig { venue: "okx".into(), instruments: vec!["ETH-USDT-SWAP".into()], ..Default::default() },
+            SignalsManagerConfig {
+                venue: "okx".into(),
+                instruments: vec!["ETH-USDT-SWAP".into()],
+                ..Default::default()
+            },
         );
         assert_eq!(manager.available_order_cash("USDT"), 25.0);
         assert_eq!(manager.positions()[0].side(), Some(Side::Sell));
-        assert!(manager.handle_event(&SignalsEvent::Subscribed { subscription_id: 15, venue: "okx".into(), instrument: "ETH-USDT-SWAP".into() }));
+        assert!(manager.handle_event(&SignalsEvent::Subscribed {
+            subscription_id: 15,
+            venue: "okx".into(),
+            instrument: "ETH-USDT-SWAP".into()
+        }));
         assert_eq!(manager.subscription_id(), 15);
         assert!(manager.handle_event(&SignalsEvent::UpdateTPSL {
             subscription_id: 15,
