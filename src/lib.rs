@@ -14,9 +14,11 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
 const FLOAT_TOLERANCE: f64 = 1e-9;
 
+/// Bearer token used to authenticate a Grexie Signals websocket connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignalsWebSocketToken(pub String);
 
+/// Signal or position direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Side {
@@ -30,6 +32,7 @@ impl Default for Side {
     }
 }
 
+/// One timeframe contribution to an aggregate signal.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SignalComponent {
@@ -44,6 +47,7 @@ pub struct SignalComponent {
     pub probability: Vec<f64>,
 }
 
+/// Public signal payload emitted by the Signals websocket.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Signal {
@@ -119,6 +123,7 @@ pub struct Signal {
     pub price: f64,
 }
 
+/// Account state for one settlement currency.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AssetSnapshot {
@@ -139,6 +144,7 @@ pub struct AssetSnapshot {
     pub updated_at: Option<String>,
 }
 
+/// Current venue position snapshot for one instrument.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Position {
@@ -189,6 +195,7 @@ pub struct Position {
 }
 
 impl Position {
+    /// Returns the side implied by the signed position size.
     pub fn side(&self) -> Option<Side> {
         if self.size < 0.0 {
             Some(Side::Sell)
@@ -199,6 +206,7 @@ impl Position {
         }
     }
 
+    /// Estimates linear unrealized PnL for the snapshot.
     pub fn unrealized_pnl(&self) -> f64 {
         if self.entry_price <= 0.0 || self.last_price <= 0.0 {
             return 0.0;
@@ -212,6 +220,7 @@ impl Position {
     }
 }
 
+/// Typed websocket event emitted by the Signals protocol.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SignalsEvent {
     Ready {
@@ -353,6 +362,7 @@ pub enum SignalsClientError {
     Http(#[from] http::Error),
 }
 
+/// Parse one raw websocket JSON message into a typed event.
 pub fn parse_event(raw: &str) -> Result<SignalsEvent, SignalsClientError> {
     let msg: RawEvent = serde_json::from_str(raw)?;
     match msg.event_type.as_str() {
@@ -461,6 +471,7 @@ pub fn parse_event(raw: &str) -> Result<SignalsEvent, SignalsClientError> {
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+/// Low-level websocket client for Grexie Signals.
 pub struct SignalsClient {
     token: SignalsWebSocketToken,
     url: String,
@@ -469,10 +480,12 @@ pub struct SignalsClient {
 }
 
 impl SignalsClient {
+    /// Creates a client that connects to the production websocket URL.
     pub fn new(token: SignalsWebSocketToken) -> Self {
         Self::with_url(token, "wss://signals.grexie.com/ws")
     }
 
+    /// Creates a client using a custom websocket URL.
     pub fn with_url(token: SignalsWebSocketToken, url: impl Into<String>) -> Self {
         Self {
             token,
@@ -482,6 +495,7 @@ impl SignalsClient {
         }
     }
 
+    /// Opens the websocket connection.
     pub async fn connect(&mut self) -> Result<(), SignalsClientError> {
         let mut request: Request<()> = self.url.as_str().into_client_request()?;
         if !self.token.0.is_empty() {
@@ -497,6 +511,7 @@ impl SignalsClient {
         Ok(())
     }
 
+    /// Subscribes to a legacy single-instrument stream.
     pub async fn subscribe(
         &mut self,
         venue: &str,
@@ -508,6 +523,7 @@ impl SignalsClient {
         .await
     }
 
+    /// Subscribes to a server-managed router basket.
     pub async fn subscribe_basket(
         &mut self,
         request: SubscribeRequest,
@@ -516,6 +532,7 @@ impl SignalsClient {
             .await
     }
 
+    /// Publishes an account asset snapshot.
     pub async fn update_asset(
         &mut self,
         subscription_id: i64,
@@ -527,6 +544,7 @@ impl SignalsClient {
         self.send_json(payload).await
     }
 
+    /// Publishes a venue position snapshot.
     pub async fn update_position(
         &mut self,
         subscription_id: i64,
@@ -549,6 +567,7 @@ impl SignalsClient {
         })).await
     }
 
+    /// Adds an instrument to an existing basket subscription.
     pub async fn add_instrument(
         &mut self,
         subscription_id: i64,
@@ -557,6 +576,7 @@ impl SignalsClient {
         self.send_json(serde_json::json!({"type": "add-instrument", "subscriptionId": subscription_id, "instrument": normalize_instrument(instrument)})).await
     }
 
+    /// Removes an instrument from an existing basket subscription.
     pub async fn remove_instrument(
         &mut self,
         subscription_id: i64,
@@ -565,14 +585,28 @@ impl SignalsClient {
         self.send_json(serde_json::json!({"type": "remove-instrument", "subscriptionId": subscription_id, "instrument": normalize_instrument(instrument)})).await
     }
 
+    /// Sends a runtime router config patch.
     pub async fn update_config(
         &mut self,
         subscription_id: i64,
         config: RuntimeConfig,
     ) -> Result<(), SignalsClientError> {
-        self.send_json(serde_json::json!({"type": "update-config", "subscriptionId": subscription_id, "profitWithdrawRatio": clamp01(config.profit_withdraw_ratio)})).await
+        let config = normalize_runtime_config(config);
+        self.send_json(serde_json::json!({
+            "type": "update-config",
+            "subscriptionId": subscription_id,
+            "maxMarginRatio": config.max_margin_ratio,
+            "minLotHaircutRatio": config.min_lot_haircut_ratio,
+            "maxConcurrentPositions": config.max_concurrent_positions,
+            "maxDrawdown": config.max_drawdown,
+            "switchBuffer": config.switch_buffer,
+            "minLeverage": config.min_leverage,
+            "maxLeverage": config.max_leverage,
+            "profitWithdrawRatio": config.profit_withdraw_ratio
+        })).await
     }
 
+    /// Schedules a withdrawal request for the router subscription.
     pub async fn schedule_withdrawal(
         &mut self,
         subscription_id: i64,
@@ -581,6 +615,7 @@ impl SignalsClient {
         self.send_json(serde_json::json!({"type": "schedule-withdrawal", "subscriptionId": subscription_id, "venue": withdrawal.venue, "currency": withdrawal.currency, "amount": withdrawal.amount, "reason": withdrawal.reason})).await
     }
 
+    /// Unsubscribes by server subscription id.
     pub async fn unsubscribe(&mut self, subscription_id: i64) -> Result<(), SignalsClientError> {
         self.send_json(
             serde_json::json!({"type": "unsubscribe", "subscriptionId": subscription_id}),
@@ -588,6 +623,7 @@ impl SignalsClient {
         .await
     }
 
+    /// Receives and parses the next websocket event.
     pub async fn receive(&mut self) -> Result<Option<SignalsEvent>, SignalsClientError> {
         let read = self.read.as_mut().ok_or(SignalsClientError::NotConnected)?;
         match read.next().await {
@@ -611,6 +647,7 @@ impl SignalsClient {
     }
 }
 
+/// Basket subscription request sent to the server-managed router.
 #[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SubscribeRequest {
@@ -621,7 +658,7 @@ pub struct SubscribeRequest {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub risk: Option<serde_json::Value>,
+    pub risk: Option<RiskConfig>,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub profit_withdraw_ratio: f64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -635,6 +672,7 @@ impl SubscribeRequest {
         self.request_type = "subscribe".into();
         self.venue = normalize_venue(&self.venue);
         self.instruments = normalize_instrument_list(self.instruments);
+        self.risk = Some(normalize_risk_config(self.risk.unwrap_or_default()));
         for asset in &mut self.assets {
             if asset.venue.is_empty() {
                 asset.venue = self.venue.clone();
@@ -649,15 +687,17 @@ impl SubscribeRequest {
     }
 }
 
+/// Configuration for one SignalsManager basket.
 #[derive(Debug, Clone, Default)]
 pub struct SignalsManagerConfig {
     pub venue: String,
     pub instruments: Vec<String>,
     pub mode: String,
-    pub risk: Option<serde_json::Value>,
+    pub risk: Option<RiskConfig>,
     pub profit_withdraw_ratio: f64,
 }
 
+/// Durable SignalsManager state for restart hydration.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SignalsManagerState {
@@ -667,11 +707,57 @@ pub struct SignalsManagerState {
     pub positions: Vec<Position>,
 }
 
-#[derive(Debug, Clone, Default)]
+/// Runtime router risk patch sent after a basket has subscribed.
+#[derive(Debug, Clone, Copy, Default)]
 pub struct RuntimeConfig {
+    pub max_margin_ratio: f64,
+    pub min_lot_haircut_ratio: f64,
+    pub max_concurrent_positions: i32,
+    pub max_drawdown: f64,
+    pub switch_buffer: f64,
+    pub min_leverage: f64,
+    pub max_leverage: f64,
     pub profit_withdraw_ratio: f64,
 }
 
+/// Router risk settings sent when subscribing to a basket.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RiskConfig {
+    #[serde(default)]
+    pub max_margin_ratio: f64,
+    #[serde(default)]
+    pub min_lot_haircut_ratio: f64,
+    #[serde(default)]
+    pub max_concurrent_positions: i32,
+    #[serde(default)]
+    pub max_drawdown: f64,
+    #[serde(default)]
+    pub switch_buffer: f64,
+    #[serde(default)]
+    pub min_leverage: f64,
+    #[serde(default)]
+    pub max_leverage: f64,
+    #[serde(default)]
+    pub profit_withdraw_ratio: f64,
+}
+
+impl Default for RiskConfig {
+    fn default() -> Self {
+        Self {
+            max_margin_ratio: 1.0,
+            min_lot_haircut_ratio: 0.0,
+            max_concurrent_positions: 0,
+            max_drawdown: 0.0,
+            switch_buffer: 0.0,
+            min_leverage: 0.0,
+            max_leverage: 0.0,
+            profit_withdraw_ratio: 0.0,
+        }
+    }
+}
+
+/// Withdrawal request scheduled against a router subscription.
 #[derive(Debug, Clone, Default)]
 pub struct WithdrawalRequest {
     pub venue: String,
@@ -680,6 +766,7 @@ pub struct WithdrawalRequest {
     pub reason: String,
 }
 
+/// Owns one server-managed router basket and local account snapshots.
 pub struct SignalsManager {
     client: SignalsClient,
     cfg: SignalsManagerConfig,
@@ -689,6 +776,7 @@ pub struct SignalsManager {
 }
 
 impl SignalsManager {
+    /// Creates a basket manager from a transport, durable state, and config.
     pub fn new(
         client: SignalsClient,
         state: SignalsManagerState,
@@ -710,14 +798,17 @@ impl SignalsManager {
         manager
     }
 
+    /// Returns mutable access to the underlying websocket client.
     pub fn client_mut(&mut self) -> &mut SignalsClient {
         &mut self.client
     }
 
+    /// Opens the underlying websocket client.
     pub async fn connect(&mut self) -> Result<(), SignalsClientError> {
         self.client.connect().await
     }
 
+    /// Subscribes the configured basket and sends current snapshots.
     pub async fn subscribe(&mut self) -> Result<(), SignalsClientError> {
         self.client
             .subscribe_basket(SubscribeRequest {
@@ -733,6 +824,7 @@ impl SignalsManager {
             .await
     }
 
+    /// Receives one event and applies it to manager state.
     pub async fn run_next(&mut self) -> Result<Option<SignalsEvent>, SignalsClientError> {
         let Some(event) = self.client.receive().await? else {
             return Ok(None);
@@ -744,6 +836,7 @@ impl SignalsManager {
         }
     }
 
+    /// Records and, once subscribed, sends an account asset snapshot.
     pub async fn update_asset(&mut self, asset: AssetSnapshot) -> Result<(), SignalsClientError> {
         let Some(asset) = self.record_asset(asset) else {
             return Ok(());
@@ -756,6 +849,7 @@ impl SignalsManager {
         Ok(())
     }
 
+    /// Records and, once subscribed, sends a venue position snapshot.
     pub async fn update_position(&mut self, position: Position) -> Result<(), SignalsClientError> {
         let Some(position) = self.record_position(position) else {
             return Ok(());
@@ -768,6 +862,7 @@ impl SignalsManager {
         Ok(())
     }
 
+    /// Adds an instrument locally and to the live subscription.
     pub async fn add_instrument(&mut self, instrument: &str) -> Result<(), SignalsClientError> {
         let instrument = normalize_instrument(instrument);
         if instrument.is_empty() {
@@ -783,6 +878,7 @@ impl SignalsManager {
         Ok(())
     }
 
+    /// Removes an instrument locally and from the live subscription.
     pub async fn remove_instrument(&mut self, instrument: &str) -> Result<(), SignalsClientError> {
         let instrument = normalize_instrument(instrument);
         self.cfg
@@ -796,8 +892,11 @@ impl SignalsManager {
         Ok(())
     }
 
+    /// Applies and optionally sends a runtime router config patch.
     pub async fn update_config(&mut self, config: RuntimeConfig) -> Result<(), SignalsClientError> {
-        self.cfg.profit_withdraw_ratio = clamp01(config.profit_withdraw_ratio);
+        let config = normalize_runtime_config(config);
+        self.cfg.risk = Some(apply_runtime_config_to_risk(self.cfg.risk.unwrap_or_default(), config));
+        self.cfg.profit_withdraw_ratio = config.profit_withdraw_ratio;
         if self.subscription_id > 0 {
             self.client
                 .update_config(self.subscription_id, config)
@@ -806,6 +905,7 @@ impl SignalsManager {
         Ok(())
     }
 
+    /// Schedules a withdrawal through the live router subscription.
     pub async fn schedule_withdrawal(
         &mut self,
         withdrawal: WithdrawalRequest,
@@ -818,6 +918,7 @@ impl SignalsManager {
             .await
     }
 
+    /// Applies one typed event to manager state.
     pub fn handle_event(&mut self, event: &SignalsEvent) -> bool {
         if !self.accepts_event(event) {
             return false;
@@ -863,16 +964,19 @@ impl SignalsManager {
         true
     }
 
+    /// Returns the active server subscription id, or 0 before subscribe.
     pub fn subscription_id(&self) -> i64 {
         self.subscription_id
     }
 
+    /// Returns asset snapshots sorted by currency.
     pub fn assets(&self) -> Vec<AssetSnapshot> {
         let mut out: Vec<_> = self.assets.values().cloned().collect();
         out.sort_by(|a, b| a.currency.cmp(&b.currency));
         out
     }
 
+    /// Returns open position snapshots sorted by venue/instrument.
     pub fn positions(&self) -> Vec<Position> {
         let mut out: Vec<_> = self.positions.values().cloned().collect();
         out.sort_by(|a, b| {
@@ -881,6 +985,7 @@ impl SignalsManager {
         out
     }
 
+    /// Returns durable state suitable for restart hydration.
     pub fn state(&self) -> SignalsManagerState {
         SignalsManagerState {
             assets: self.assets(),
@@ -888,6 +993,7 @@ impl SignalsManager {
         }
     }
 
+    /// Returns available cash after applying the asset max_usage cap.
     pub fn available_order_cash(&self, currency: &str) -> f64 {
         self.assets
             .get(&currency.trim().to_uppercase())
@@ -970,8 +1076,89 @@ impl SignalsManager {
 fn normalize_manager_config(mut cfg: SignalsManagerConfig) -> SignalsManagerConfig {
     cfg.venue = normalize_venue(&cfg.venue);
     cfg.instruments = normalize_instrument_list(cfg.instruments);
+    cfg.risk = Some(normalize_risk_config(cfg.risk.unwrap_or_default()));
     cfg.profit_withdraw_ratio = clamp01(cfg.profit_withdraw_ratio);
     cfg
+}
+
+fn normalize_risk_config(mut risk: RiskConfig) -> RiskConfig {
+    risk.max_margin_ratio = clamp01(positive_or(risk.max_margin_ratio, 1.0));
+    if !risk.min_lot_haircut_ratio.is_finite() || risk.min_lot_haircut_ratio < 0.0 {
+        risk.min_lot_haircut_ratio = 0.0;
+    }
+    if risk.max_concurrent_positions < 0 {
+        risk.max_concurrent_positions = 0;
+    }
+    if !risk.max_drawdown.is_finite() || risk.max_drawdown < 0.0 {
+        risk.max_drawdown = 0.0;
+    }
+    if !risk.switch_buffer.is_finite() || risk.switch_buffer < 0.0 {
+        risk.switch_buffer = 0.0;
+    }
+    if !risk.min_leverage.is_finite() || risk.min_leverage < 0.0 {
+        risk.min_leverage = 0.0;
+    }
+    if !risk.max_leverage.is_finite() || risk.max_leverage < 0.0 {
+        risk.max_leverage = 0.0;
+    }
+    if risk.max_leverage > 0.0 && risk.min_leverage > risk.max_leverage {
+        risk.min_leverage = risk.max_leverage;
+    }
+    risk.profit_withdraw_ratio = clamp01(risk.profit_withdraw_ratio);
+    risk
+}
+
+fn normalize_runtime_config(mut config: RuntimeConfig) -> RuntimeConfig {
+    config.max_margin_ratio = clamp01(config.max_margin_ratio);
+    if !config.min_lot_haircut_ratio.is_finite() || config.min_lot_haircut_ratio < 0.0 {
+        config.min_lot_haircut_ratio = 0.0;
+    }
+    if config.max_concurrent_positions < 0 {
+        config.max_concurrent_positions = 0;
+    }
+    if !config.max_drawdown.is_finite() || config.max_drawdown < 0.0 {
+        config.max_drawdown = 0.0;
+    }
+    if !config.switch_buffer.is_finite() || config.switch_buffer < 0.0 {
+        config.switch_buffer = 0.0;
+    }
+    if !config.min_leverage.is_finite() || config.min_leverage < 0.0 {
+        config.min_leverage = 0.0;
+    }
+    if !config.max_leverage.is_finite() || config.max_leverage < 0.0 {
+        config.max_leverage = 0.0;
+    }
+    if config.max_leverage > 0.0 && config.min_leverage > config.max_leverage {
+        config.min_leverage = config.max_leverage;
+    }
+    config.profit_withdraw_ratio = clamp01(config.profit_withdraw_ratio);
+    config
+}
+
+fn apply_runtime_config_to_risk(mut risk: RiskConfig, config: RuntimeConfig) -> RiskConfig {
+    if config.max_margin_ratio > 0.0 {
+        risk.max_margin_ratio = config.max_margin_ratio;
+    }
+    if config.min_lot_haircut_ratio > 0.0 {
+        risk.min_lot_haircut_ratio = config.min_lot_haircut_ratio;
+    }
+    if config.max_concurrent_positions > 0 {
+        risk.max_concurrent_positions = config.max_concurrent_positions;
+    }
+    if config.max_drawdown > 0.0 {
+        risk.max_drawdown = config.max_drawdown;
+    }
+    if config.switch_buffer > 0.0 {
+        risk.switch_buffer = config.switch_buffer;
+    }
+    if config.min_leverage > 0.0 {
+        risk.min_leverage = config.min_leverage;
+    }
+    if config.max_leverage > 0.0 {
+        risk.max_leverage = config.max_leverage;
+    }
+    risk.profit_withdraw_ratio = config.profit_withdraw_ratio;
+    normalize_risk_config(risk)
 }
 
 fn normalize_venue(venue: &str) -> String {
